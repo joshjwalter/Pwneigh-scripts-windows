@@ -49,5 +49,5 @@ if (Get-ItemProperty -Path 'HKCU:\Software\Sysinternals' -Name 'EulaAccepted' -E
 # 6. Tools folder.
 if (Test-Path $ToolsDir) { Invoke-Step "delete $ToolsDir" { Remove-Item -Path $ToolsDir -Recurse -Force } }
 
-Write-Log "Reset done. NOT undone: password changes (set them back by hand). Backups and logs are still in $OutDir."
+Write-Log "Reset done. NOT undone: password changes and deleted accounts - fix those by hand. Backups are still in $OutDir."
 if ($State.Failures.Count) { Write-Log "Failures: $($State.Failures -join ', ')" }
