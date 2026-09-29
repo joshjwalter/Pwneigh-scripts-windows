@@ -15,8 +15,11 @@ Before recommending or helping run it for real (not `-DryRun`), check:
 
 1. **Tunables block (lines ~5-26) is filled in for *this* competition**, not left over from a
    previous one. In particular:
-   - `$AuthorizedUsers` — if empty, *every* non-built-in local account gets deleted. Confirm
-     that's actually intended before proceeding.
+   - `$AuthorizedUsers` — if empty, account deletion is **skipped entirely** (nothing gets
+     removed). If non-empty, *every other* non-built-in local account gets deleted. Confirm
+     which of those two behaviors is actually intended before proceeding — an operator who left
+     it empty by mistake, believing unauthorized accounts would be purged, won't get a deletion
+     at all.
    - `$ExcludeUsers` — accounts whose passwords must not change; cross-check against any
      service/scheduled-task accounts the user has mentioned.
    - `$AllowTcp` / `$AllowUdp` / `$BlockTcp` / `$BlockUdp` — should match the scored services in

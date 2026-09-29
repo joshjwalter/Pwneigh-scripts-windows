@@ -7,12 +7,18 @@ $toolName = $input_.tool_name
 $filePath = $input_.tool_input.file_path
 
 if ($toolName -notin @('Edit', 'MultiEdit', 'Write')) { exit 0 }
-if (-not $filePath -or (Split-Path $filePath -Leaf) -ne 'hpcc4-simple.ps1') { exit 0 }
+if (-not $filePath -or $filePath -notlike '*.ps1') { exit 0 }
+
+# Identify the main script by content, not filename: reset-hpcc4.ps1's own -MainScript workflow means an operator may
+# keep renamed per-competition copies (e.g. hpcc4-comp3.ps1), which a filename check would silently miss.
+$marker = '# HPCC4-SIMPLE-SCRIPT v1'
+$isMainScript = if ($toolName -eq 'Write') { "$($input_.tool_input.content)" -match [regex]::Escape($marker) } else { (Test-Path $filePath) -and (Select-String -Path $filePath -SimpleMatch $marker -Quiet) }
+if (-not $isMainScript) { exit 0 }
 
 $tunableNames = @(
     'KeepOpenTcp', 'AllowTcp', 'AllowUdp', 'BlockTcp', 'BlockUdp',
     'ExcludeUsers', 'AuthorizedUsers', 'ToolsDir', 'ToolsZip', 'ToolsZipSha256',
-    'AvInstallerUrl', 'InstallSysmon', 'BackupPaths', 'LockPaths', 'OutDir',
+    'AvInstallerUrl', 'AvInstallerExpectedSigner', 'InstallSysmon', 'BackupPaths', 'LockPaths', 'OutDir',
     'DisableServices', 'DodGpoDir', 'LgpoExe'
 )
 

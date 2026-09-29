@@ -1,0 +1,40 @@
+HPCC4 PROD-BUILD TODO (do this on a COPY, right before comp day - never edit the real source down)
+=====================================================================================================
+Goal: strip anything that isn't exactly what needs to run, then obfuscate, so a red teamer who gets
+read access to the box has to actually reverse-engineer it instead of just reading it.
+
+1. EXCLUDE THESE FILES ENTIRELY FROM THE PROD BUILD
+   [ ] watch-hpcc4.ps1              - test/dev-only monitor, never touches the scored box
+   [ ] .claude/ (whole directory)   - hooks, skills, agent defs, settings.json - Claude Code tooling only
+   [ ] gpo-verification-checklist.md - tells a reader exactly which STIG settings you rely on / skipped
+   [ ] .git/                        - full uncompiled version history; do not bundle if packaging/compiling
+
+2. STRIP FROM hpcc4-simple.ps1 AND reset-hpcc4.ps1
+   [ ] Every '#' explanatory comment (the "why" comments throughout - e.g. the notes above
+       Test-SuspiciousPath, Get-PersistenceReport, Set-FirewallLockdown, Install-DodGpo explaining
+       exactly what's checked/how it works)
+   [ ] The '# HPCC4-SIMPLE-SCRIPT v1' marker comment + tunables-block comments (dev-tooling only)
+   [ ] The SuppressMessageAttribute(...) linting attribute (no runtime purpose)
+   [ ] reset-hpcc4.ps1's usage header block (the -MainScript examples, the "can't undo password
+       changes" note) - tells a reader the rollback capability exists and how to invoke it
+
+3. DO NOT STRIP (don't over-scope the cleanup)
+   [ ] -DryRun itself - real functionality, a safety net for re-running under time pressure.
+       Comments explaining it go; the switch stays.
+
+4. REAL OBFUSCATION (compiling to .exe alone does NOT hide the script - most compilers just embed
+   the script text, sometimes base64'd, as a resource; `strings`/resource extraction gets it back
+   in under a minute. These are the steps that actually matter)
+   [ ] Rename every function and variable to meaningless names
+       (Get-PersistenceReport -> f7, $AuthorizedUsers -> $a3, etc.)
+   [ ] Run the result through Invoke-Obfuscation (the standard PowerShell obfuscator) rather than
+       relying on an EXE wrapper alone
+   [ ] Only THEN compile/package the obfuscated build if still wanted, as the very last step
+
+5. FINAL CHECKS BEFORE COPYING TO THE BOX
+   [ ] Diff the stripped/obfuscated build's behavior against the real source on a test VM - same
+       Invoke-Step call order, same tunables, nothing silently changed by the rename/strip pass
+   [ ] Confirm the tunables ($AuthorizedUsers, $AllowTcp/$AllowUdp, $KeepOpenTcp, $ExcludeUsers,
+       $DodGpoDir, etc.) are filled in for THIS competition, not left over from testing
+   [ ] Keep the real, commented source (this repo) as your actual working copy for next time -
+       never overwrite it with the stripped build

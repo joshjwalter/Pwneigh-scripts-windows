@@ -8,8 +8,8 @@ if (-not $MainScript) { $MainScript = Join-Path $PSScriptRoot 'hpcc4-simple.ps1'
 # Stop before doing anything if the main script is missing, or isn't the HPCC4 script: everything below needs its settings
 # and helpers, and loading a different script (one without the dot-source guard) would RUN it.
 if (-not (Test-Path $MainScript)) { Write-Host "Can't find $MainScript. Put this file next to hpcc4-simple.ps1, or run: .\reset-hpcc4.ps1 -MainScript <path to it>. Nothing changed." -ForegroundColor Red; exit 1 }
-if (-not (Select-String -Path $MainScript -SimpleMatch "if (`$MyInvocation.InvocationName -ne '.') { Main }" -Quiet) -or -not (Select-String -Path $MainScript -SimpleMatch 'function Unlock-Paths' -Quiet)) {
-    Write-Host "$MainScript doesn't look like hpcc4-simple.ps1, so it won't be loaded. Nothing changed." -ForegroundColor Red; exit 1
+if (-not (Select-String -Path $MainScript -SimpleMatch '# HPCC4-SIMPLE-SCRIPT v1' -Quiet)) {
+    Write-Host "$MainScript doesn't look like hpcc4-simple.ps1 (missing its identity marker), so it won't be loaded. Nothing changed." -ForegroundColor Red; exit 1
 }
 . $MainScript   # loads tunables and helpers only; the guard at its end stops it from running
 if (-not $OutDir -or -not $ToolsDir) { Write-Host "$MainScript has an empty `$OutDir or `$ToolsDir. Nothing changed." -ForegroundColor Red; exit 1 }
