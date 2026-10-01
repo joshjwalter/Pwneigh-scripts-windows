@@ -8,11 +8,17 @@ function Invoke-Hpcc4Tests {
     [CmdletBinding()]
     param([string[]]$Path, [string]$ResultDirectory)
     if (-not $PSBoundParameters.ContainsKey('Path')) { $Path = @($PSScriptRoot) }
+    $exitVariable = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+    if ($null -ne $exitVariable -and ($exitVariable.Options -band
+        ([Management.Automation.ScopedItemOptions]::ReadOnly -bor [Management.Automation.ScopedItemOptions]::Constant))) {
+        Write-Host 'Test infrastructure refused: global exit state is protected.'
+        return [pscustomobject]@{ ExitCode = 1; Summary = $null }
+    }
     $flagExisted = Test-Path Env:\HPCC4_PESTER_RUNNING
     $priorFlag = $env:HPCC4_PESTER_RUNNING
     $priorTls = [Net.ServicePointManager]::SecurityProtocol
-    $exitExisted = $null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)
-    $priorExit = $global:LASTEXITCODE
+    $exitExisted = $null -ne $exitVariable
+    $priorExit = if ($exitExisted) { $exitVariable.Value } else { $null }
     $exitCode = 1
     $summary = $null
     try {
@@ -50,11 +56,18 @@ function Invoke-Hpcc4Tests {
         Write-Host 'Test infrastructure failed; inspect local detailed output.'
         $exitCode = 1
     } finally {
-        [Net.ServicePointManager]::SecurityProtocol = $priorTls
-        if ($exitExisted) { $global:LASTEXITCODE = $priorExit }
-        else { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
-        if ($flagExisted) { $env:HPCC4_PESTER_RUNNING = $priorFlag }
-        else { Remove-Item Env:\HPCC4_PESTER_RUNNING -ErrorAction SilentlyContinue }
+        # A restoration failure is non-success; independent state must still
+        # be restored. Never force a protected variable changed during tests.
+        try { [Net.ServicePointManager]::SecurityProtocol = $priorTls }
+        catch { $exitCode = 1; Write-Host 'Test infrastructure failed: TLS restoration.' }
+        try {
+            if ($exitExisted) { Set-Variable LASTEXITCODE -Scope Global -Value $priorExit -ErrorAction Stop }
+            elseif ($null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)) { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction Stop }
+        } catch { $exitCode = 1; Write-Host 'Test infrastructure failed: exit state restoration.' }
+        try {
+            if ($flagExisted) { $env:HPCC4_PESTER_RUNNING = $priorFlag }
+            elseif (Test-Path Env:\HPCC4_PESTER_RUNNING) { Remove-Item Env:\HPCC4_PESTER_RUNNING -ErrorAction Stop }
+        } catch { $exitCode = 1; Write-Host 'Test infrastructure failed: flag restoration.' }
     }
     [pscustomobject]@{ ExitCode = $exitCode; Summary = $summary }
 }

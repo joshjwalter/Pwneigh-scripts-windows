@@ -45,6 +45,102 @@ Describe 'Pinned runner child process contract' {
     }
 }
 
+Describe 'Runner protected exit state in disposable children' {
+    BeforeAll {
+        $protectedChild = @'
+param([string]$Runner, [string]$Option, [string]$Preference, [string]$FlagState, [switch]$DuringRun)
+. $Runner
+$ErrorActionPreference = $Preference
+$ProgressPreference = 'SilentlyContinue'; $ConfirmPreference = 'None'; $WhatIfPreference = $false; $PSNativeCommandUseErrorActionPreference = $false
+if ($FlagState -eq 'sentinel') { $env:HPCC4_PESTER_RUNNING = 'protected-sentinel' }
+else { Remove-Item Env:\HPCC4_PESTER_RUNNING -ErrorAction SilentlyContinue }
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::SystemDefault
+$script:imports = 0; $script:invokes = 0
+function Import-Module { [CmdletBinding()] param($Name, $RequiredVersion) $script:imports++ }
+function Get-Module { param($Name) [pscustomobject]@{ Version = [version]'5.9.1' } }
+function New-PesterConfiguration { @{ Run = @{}; Output = @{} } }
+function Invoke-Pester {
+    [CmdletBinding()] param($Configuration)
+    $script:invokes++
+    if ($DuringRun) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Remove-Variable LASTEXITCODE -Scope Global -ErrorAction Stop
+        New-Variable LASTEXITCODE -Scope Global -Value 91 -Option $Option
+    }
+    @{ TotalCount = 1; PassedCount = 1; FailedCount = 0; FailedContainersCount = 0; FailedBlocksCount = 0; SkippedCount = 0; NotRunCount = 0; InconclusiveCount = 0; Duration = [TimeSpan]::Zero }
+}
+Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+if ($DuringRun) { New-Variable LASTEXITCODE -Scope Global -Value 77 }
+else { New-Variable LASTEXITCODE -Scope Global -Value 77 -Option $Option }
+$decision = $null; $failure = $null
+try { $decision = Invoke-Hpcc4Tests -Path 'unused-harmless-fixture' } catch { $failure = $_.FullyQualifiedErrorId }
+$exitVariable = Get-Variable LASTEXITCODE -Scope Global
+[pscustomobject]@{
+    Thrown = $failure; Decisions = @($decision).Count; DecisionExit = $decision.ExitCode
+    Imports = $script:imports; Invokes = $script:invokes
+    FlagExists = Test-Path Env:\HPCC4_PESTER_RUNNING; FlagValue = $env:HPCC4_PESTER_RUNNING
+    ExitValue = $exitVariable.Value; ExitOptions = $exitVariable.Options.ToString()
+    Tls = [Net.ServicePointManager]::SecurityProtocol.ToString(); Preference = $ErrorActionPreference.ToString()
+    Progress = $ProgressPreference.ToString(); Confirm = $ConfirmPreference.ToString(); WhatIf = $WhatIfPreference; NativePreference = $PSNativeCommandUseErrorActionPreference
+} | ConvertTo-Json -Compress
+exit 0
+'@
+    }
+    It 'refuses protected <Option> with <Preference> and flag <FlagState> before Pester' -TestCases @(
+        foreach ($option in 'ReadOnly', 'Constant') {
+            foreach ($preference in 'Stop', 'Continue') {
+                foreach ($flagState in 'absent', 'sentinel') { @{ Option = $option; Preference = $preference; FlagState = $flagState } }
+            }
+        }
+    ) {
+        param($Option, $Preference, $FlagState)
+        $child = Join-Path $TestDrive 'protected-child.ps1'
+        [IO.File]::WriteAllText($child, $protectedChild, [Text.UTF8Encoding]::new($true))
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $child -Runner $runnerPath -Option $Option -Preference $Preference -FlagState $FlagState 2>&1
+        $childExit = $LASTEXITCODE
+        $childExit | Should -Be 0
+        $observation = ($childOutput | Where-Object { "$_".StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
+        $observation.Thrown | Should -BeNullOrEmpty
+        $observation.Decisions | Should -Be 1
+        $observation.DecisionExit | Should -Be 1
+        $observation.Imports | Should -Be 0
+        $observation.Invokes | Should -Be 0
+        $observation.FlagExists | Should -Be ($FlagState -eq 'sentinel')
+        if ($FlagState -eq 'sentinel') { $observation.FlagValue | Should -Be 'protected-sentinel' }
+        $observation.ExitValue | Should -Be 77
+        $observation.ExitOptions | Should -Be $Option
+        $observation.Tls | Should -Be 'SystemDefault'
+        $observation.Preference | Should -Be $Preference
+        $observation.Progress | Should -Be 'SilentlyContinue'; $observation.Confirm | Should -Be 'None'
+        $observation.WhatIf | Should -BeFalse; $observation.NativePreference | Should -BeFalse
+    }
+    It 'continues independent restoration when Pester introduces <Option> with <Preference>' -TestCases @(
+        @{ Option = 'ReadOnly'; Preference = 'Stop' }, @{ Option = 'ReadOnly'; Preference = 'Continue' },
+        @{ Option = 'Constant'; Preference = 'Stop' }, @{ Option = 'Constant'; Preference = 'Continue' }
+    ) {
+        param($Option, $Preference)
+        $child = Join-Path $TestDrive 'protected-child.ps1'
+        [IO.File]::WriteAllText($child, $protectedChild, [Text.UTF8Encoding]::new($true))
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $child -Runner $runnerPath -Option $Option -Preference $Preference -FlagState sentinel -DuringRun 2>&1
+        $childExit = $LASTEXITCODE
+        $childExit | Should -Be 0
+        $observation = ($childOutput | Where-Object { "$_".StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
+        $observation.Thrown | Should -BeNullOrEmpty
+        $observation.Decisions | Should -Be 1
+        $observation.DecisionExit | Should -Be 1
+        $observation.Imports | Should -Be 1
+        $observation.Invokes | Should -Be 1
+        $observation.FlagExists | Should -BeTrue
+        $observation.FlagValue | Should -Be 'protected-sentinel'
+        $observation.ExitValue | Should -Be 91
+        $observation.ExitOptions | Should -Be $Option
+        $observation.Tls | Should -Be 'SystemDefault'
+        $observation.Preference | Should -Be $Preference
+        $observation.Progress | Should -Be 'SilentlyContinue'; $observation.Confirm | Should -Be 'None'
+        $observation.WhatIf | Should -BeFalse; $observation.NativePreference | Should -BeFalse
+    }
+}
+
 Describe 'Runner restores environment and refuses incomplete results in process' {
     BeforeEach {
         $script:fakeResult = New-FakePesterResult
