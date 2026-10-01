@@ -1,4 +1,4 @@
-# HPCC4 defensive helper: backup, firewall, unauthorized-account removal, local passwords, tools, ACL lock.
+﻿# HPCC4 defensive helper: backup, firewall, unauthorized-account removal, local passwords, tools, ACL lock.
 # HPCC4-SIMPLE-SCRIPT v1 - stable identity marker; keep this exact line if you rename or copy this file (reset-hpcc4.ps1 and the pre-edit hook key off it, not the filename).
 # Every change runs through Invoke-Step, so one failure never stops the rest. Windows PowerShell 5.1, Server 2022-2025.
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseCompatibleCommands', 'Write-Log', Justification = 'Defined in this script')]
@@ -402,27 +402,34 @@ function Write-Summary {
     Write-Log "Tools installed: $($State.ToolsInstalled) | Hash check: $($State.HashChecked) | AV installer: $($State.AvInstaller) | Locked: $($State.Locked -join ', ') | Failures: $($State.Failures -join ', ')"
     if (-not $State.GpoApplied.Count) { Write-Log 'WARNING: no DoD STIG GPOs were applied this run - baseline hardening in gpo-verification-checklist.md (RDP NLA, WDigest, SMBv1, SMB signing, Guest account) was NOT applied by anything unless you did it by hand.' }
 }
-# Clears PS history, wipes all Windows Event Logs, then schedules the script and its directory for deletion after exit.
+# Clears PS history and Windows Event Logs; directory self-deletion is refused pending safe exact-file cleanup.
 function Invoke-Cleanup {
-    if ($DryRun) { Write-Log 'WOULD: clear PS history, clear event logs, self-delete script and directory'; return }
+    if ($DryRun) { Write-Log 'WOULD: clear PS history, clear event logs; directory self-deletion is refused - delete the script by hand'; return }
     Invoke-Step 'clear PS history' { Remove-Item (Get-PSReadLineOption).HistorySavePath -ErrorAction SilentlyContinue }
     Invoke-Step 'clear event logs' {
         Get-WinEvent -ListLog * | ForEach-Object {
             try { [Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($_.LogName) } catch {}
         }
     }
-    $scriptPath = $PSCommandPath
     $scriptDir  = $PSScriptRoot
     # Never self-delete a folder that holds $OutDir/$ToolsDir - that would destroy the backups, ACL-restore files and
     # persistence report this very run just produced, with no way to get them back.
-    $scriptDirFull = try { (Resolve-Path $scriptDir -ErrorAction Stop).Path } catch { $scriptDir }
-    $unsafe = @($OutDir, $ToolsDir) | Where-Object { $_ } | Where-Object {
-        $full = try { (Resolve-Path $_ -ErrorAction Stop).Path } catch { $_ }
-        $full -ieq $scriptDirFull -or $full.StartsWith("$scriptDirFull\", [StringComparison]::OrdinalIgnoreCase)
+    try {
+        $scriptDirFull = (Resolve-Path $scriptDir -ErrorAction Stop).Path
+        if ($scriptDirFull -isnot [string] -or -not $scriptDirFull) { throw 'No resolved directory string' }
+    } catch { Write-Log "WARNING: not self-deleting $scriptDir - unresolved script directory. Delete the script by hand once you've saved anything you need."; return }
+    $unsafe = @()
+    foreach ($candidate in @($OutDir, $ToolsDir)) {
+        if (-not $candidate) { continue }
+        # Keep the input separately: catch's $_ is an ErrorRecord, never a path.
+        try {
+            $full = (Resolve-Path $candidate -ErrorAction Stop).Path
+            if ($full -isnot [string] -or -not $full) { throw 'No resolved candidate string' }
+        } catch { Write-Log "WARNING: not self-deleting $scriptDir - unresolved path $candidate. Delete the script by hand once you've saved anything you need."; return }
+        if ($full -ieq $scriptDirFull -or $full.StartsWith("$scriptDirFull\", [StringComparison]::OrdinalIgnoreCase)) { $unsafe += $candidate }
     }
     if ($unsafe.Count) { Write-Log "WARNING: not self-deleting $scriptDir - it contains $($unsafe -join ', '). Delete the script by hand once you've saved anything you need from there."; return }
-    Write-Log "Scheduling self-delete: $scriptPath and $scriptDir"
-    Invoke-Step 'self-delete script and directory' { cmd /c "ping -n 2 127.0.0.1 > nul & del /f /q `"$scriptPath`" & rmdir /s /q `"$scriptDir`"" }
+    Write-Log "WARNING: not self-deleting $scriptDir - directory deletion is refused pending safe exact-file cleanup. Delete the script by hand once you've saved anything you need."
 }
 function Main {
     if (-not (Test-IsAdmin)) { Write-Log 'Must be run elevated (as Administrator). Exiting.'; exit 1 }
