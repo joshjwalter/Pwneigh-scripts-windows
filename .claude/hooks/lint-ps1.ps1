@@ -1,15 +1,28 @@
-﻿function Get-Hpcc4LintResult {
-    param([string]$Path)
-    if(-not $Path -or [IO.Path]::GetExtension($Path) -ine '.ps1'){return @{Status='Clean'}}
-    try{
-        if(-not(Test-Path -LiteralPath $Path)){throw 'File unavailable'}
-        if(-not(Get-Module -ListAvailable PSScriptAnalyzer)){return @{Status='Skipped';Message='PSScriptAnalyzer unavailable; lint SKIPPED.'}}
-        $results=@(Invoke-ScriptAnalyzer -Path $Path -Severity Warning,Error -ErrorAction Stop)
-        if(-not $results.Count){return @{Status='Clean'}}
-        return @{Status='Findings';Message=($results | ForEach-Object {"[$($_.Severity)] line $($_.Line): $($_.RuleName) - $($_.Message)"}) -join "`n"}
-    }catch{return @{Status='Failed';Message='Lint FAILED; analysis did not complete.'}}
+$ErrorActionPreference = 'Stop'
+$input_ = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$filePath = $input_.tool_input.file_path
+if (-not $filePath -or $filePath -notlike '*.ps1') { exit 0 }
+if (-not (Test-Path $filePath)) { exit 0 }
+if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+    $output = @{
+        hookSpecificOutput = @{
+            hookEventName     = 'PostToolUse'
+            additionalContext = "PSScriptAnalyzer is not installed - lint check for $(Split-Path $filePath -Leaf) was SKIPPED, not passed. Install it (Install-Module PSScriptAnalyzer) for real lint coverage."
+        }
+    } | ConvertTo-Json -Depth 5 -Compress
+    Write-Output $output
+    exit 0
 }
-if ($MyInvocation.InvocationName -ne '.') {
-    try{$inputData=[Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop;$result=Get-Hpcc4LintResult $inputData.tool_input.file_path}catch{$result=@{Status='Failed';Message='Lint FAILED: malformed hook input.'}}
-    if($result.Status -ne 'Clean'){@{Status=$result.Status;hookSpecificOutput=@{hookEventName='PostToolUse';additionalContext=$result.Message}} | ConvertTo-Json -Depth 6 -Compress}
-}
+
+$results = Invoke-ScriptAnalyzer -Path $filePath -Severity Warning, Error
+if (-not $results) { exit 0 }
+
+$lines = $results | ForEach-Object { "  [$($_.Severity)] line $($_.Line): $($_.RuleName) - $($_.Message)" }
+$output = @{
+    hookSpecificOutput = @{
+        hookEventName     = 'PostToolUse'
+        additionalContext = "PSScriptAnalyzer findings for $(Split-Path $filePath -Leaf):`n$($lines -join "`n")"
+    }
+} | ConvertTo-Json -Depth 5 -Compress
+Write-Output $output
+exit 0
