@@ -1,53 +1,43 @@
-# reset-hpcc4.ps1 - FOR TEST VMs ONLY. Undoes what hpcc4-simple.ps1 changed, so you can run it again from a clean state.
-# It reads the same tunables ($OutDir, $ToolsDir) from hpcc4-simple.ps1. By default that file must be in the same folder;
-# if you renamed it or moved it, pass its path:  .\reset-hpcc4.ps1 -MainScript C:\path\to\your-copy.ps1
-# It can't undo password changes: the old passwords were never stored.
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseCompatibleCommands', 'Write-Log', Justification = 'Defined in hpcc4-simple.ps1')]
-param([string]$MainScript = '')
-if (-not $MainScript) { $MainScript = Join-Path $PSScriptRoot 'hpcc4-simple.ps1' }
-# Stop before doing anything if the main script is missing, or isn't the HPCC4 script: everything below needs its settings
-# and helpers, and loading a different script (one without the dot-source guard) would RUN it.
-if (-not (Test-Path $MainScript)) { Write-Host "Can't find $MainScript. Put this file next to hpcc4-simple.ps1, or run: .\reset-hpcc4.ps1 -MainScript <path to it>. Nothing changed." -ForegroundColor Red; exit 1 }
-if (-not (Select-String -Path $MainScript -SimpleMatch '# HPCC4-SIMPLE-SCRIPT v1' -Quiet)) {
-    Write-Host "$MainScript doesn't look like hpcc4-simple.ps1 (missing its identity marker), so it won't be loaded. Nothing changed." -ForegroundColor Red; exit 1
+﻿# VM/operator companion. Restore only captured supported resources and retain
+# all originals. Passwords, deleted accounts and blanket GPO rollback are unavailable.
+param([string]$MainScript='')
+function Invoke-Hpcc4Reset {
+    param([string]$MainScript)
+    $script:ResetFailure=$null
+    try {
+        if(-not $MainScript){$MainScript=Join-Path $PSScriptRoot 'hpcc4-simple.ps1'}
+        $path=[IO.Path]::GetFullPath($MainScript)
+        $tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)
+        if($errors.Count -or $ast.Extent.Text -notmatch '(?m)^# HPCC4-SIMPLE-SCRIPT v1 ' -or $ast.EndBlock.Statements[-1].Extent.Text -ne 'if ($MyInvocation.InvocationName -ne ''.'') { Invoke-DirectEntry }'){throw 'Unsupported source/guard'}
+        foreach($statement in $ast.EndBlock.Statements | Select-Object -SkipLast 1){
+            if($statement -is [Management.Automation.Language.FunctionDefinitionAst]){continue}
+            if($statement -isnot [Management.Automation.Language.AssignmentStatementAst]){throw 'Unsupported source load'}
+            if(@($statement.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst]},$true)).Count){throw 'Source load CLR invocation refused'}
+            $commands=@($statement.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))
+            if($commands.Count -and ($commands.Count -ne 1 -or $commands[0].GetCommandName() -ne 'New-RunState' -or $statement.Left.Extent.Text -ne '$null')){throw 'Source load action refused'}
+        }
+        # Operator-selected trusted original; compatibility is not authentication.
+        . $path
+        $script:Unlock=$true;$Unlock=$true;$DryRun=$false;$Cleanup=$false;$null=New-RunState
+        Initialize-RunPreflight
+        if(-not(Initialize-Setup)){throw 'Captured recovery storage unavailable'}
+        $read=Read-RecoveryRecords $OutDir
+        if($read.Status -notin 'Complete','Absent'){throw 'Recovery metadata incomplete'}
+        if((Read-Host 'Restore captured ACL/registry resources only? Type RESET') -cne 'RESET'){return 0}
+        foreach($record in @($read.Items | Where-Object State -ne 'Restored')){
+            switch($record.Kind){
+                Acl {$null=Restore-AclRecoveryRecord $record}
+                Registry {$null=Restore-OwnedRegistryRecord $record}
+                Tool {Add-RunFailure 'Reset' 'Tool' 'Service/configuration rollback requires manual verification; no uninstall attempted'}
+                default {Write-Log "Retained $($record.Kind) evidence; no supported automatic restore for this resource."}
+            }
+        }
+        Write-Log 'Originals retained. Passwords/deleted SIDs and blanket firewall/GPO policy are not automatically restored.'
+        if($State.Failures.Count){return 1};return 0
+    }catch{
+        $script:ResetFailure=[pscustomobject]@{Stage='Reset';Operation='CheckedRestore';Detail=$_.Exception.GetType().Name}
+        Write-Host 'Reset refused or incomplete; preserve recovery inputs and inspect the failure.'
+        return 1
+    }finally{if(Get-Command Close-RecoverySession -CommandType Function -ErrorAction SilentlyContinue){Close-RecoverySession}}
 }
-. $MainScript   # loads tunables and helpers only; the guard at its end stops it from running
-if (-not $OutDir -or -not $ToolsDir) { Write-Host "$MainScript has an empty `$OutDir or `$ToolsDir. Nothing changed." -ForegroundColor Red; exit 1 }
-
-if (-not (Test-IsAdmin)) { Write-Host 'Must be run elevated (as Administrator). Exiting.'; exit 1 }
-Write-Host "This undoes hpcc4-simple.ps1 on THIS machine: firewall, file locks, machine PATH, Sysinternals EULA flag, Sysmon, and it DELETES $ToolsDir." -ForegroundColor Yellow
-if ((Read-Host 'Type RESET to continue') -cne 'RESET') { Write-Host 'Nothing changed.'; exit 0 }
-
-# 1. Firewall: put back the exact policy saved before the first run (rules, on/off state, default actions).
-$wfw = Join-Path $OutDir 'firewall-before.wfw'
-if (Test-Path $wfw) { Invoke-Step 'restore firewall from firewall-before.wfw' { netsh advfirewall import $wfw } }
-else { Write-Log "WARNING: $wfw not found - firewall NOT restored." }
-
-# 2. File locks: the same thing as hpcc4-simple.ps1 -Unlock.
-Unlock-Paths
-
-# 3. Sysmon: uninstall it if its service exists. (When installed, Sysmon copies itself into the Windows folder.)
-if (Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue) {
-    $exe = @((Join-Path $env:windir 'Sysmon64.exe'), (Join-Path $ToolsDir 'Sysmon64.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($exe) { Invoke-Step 'uninstall Sysmon' { & $exe -u force } }
-    else { Write-Log 'WARNING: Sysmon service found but Sysmon64.exe not found - uninstall it by hand.' }
-}
-
-# 4. Machine PATH: remove the $ToolsDir entry, keeping %vars% in the other entries unexpanded.
-$key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
-$old = (Get-Item $key).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-if (@($old -split ';') | Where-Object { $_.TrimEnd('\') -ieq $ToolsDir.TrimEnd('\') }) {
-    $new = (@($old -split ';') | Where-Object { $_.TrimEnd('\') -ine $ToolsDir.TrimEnd('\') }) -join ';'
-    Invoke-Step 'remove ToolsDir from machine PATH' { New-ItemProperty -Path $key -Name 'Path' -Value $new -PropertyType ExpandString -Force | Out-Null }
-}
-
-# 5. Sysinternals EULA flag (current user only, same as the main script sets it).
-if (Get-ItemProperty -Path 'HKCU:\Software\Sysinternals' -Name 'EulaAccepted' -ErrorAction SilentlyContinue) {
-    Invoke-Step 'remove Sysinternals EULA flag' { Remove-ItemProperty -Path 'HKCU:\Software\Sysinternals' -Name 'EulaAccepted' }
-}
-
-# 6. Tools folder.
-if (Test-Path $ToolsDir) { Invoke-Step "delete $ToolsDir" { Remove-Item -Path $ToolsDir -Recurse -Force } }
-
-Write-Log "Reset done. NOT undone: password changes and deleted accounts - fix those by hand. Backups are still in $OutDir."
-if ($State.Failures.Count) { Write-Log "Failures: $($State.Failures -join ', ')" }
+if ($MyInvocation.InvocationName -ne '.') { exit (Invoke-Hpcc4Reset $MainScript) }

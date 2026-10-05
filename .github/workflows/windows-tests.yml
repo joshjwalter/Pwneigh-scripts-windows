@@ -1,0 +1,52 @@
+name: Windows tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    name: ${{ matrix.shell }} / Pester 5.9.1
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Pester
+        shell: pwsh
+        run: |
+          & '${{ matrix.shell }}' -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {
+            $ErrorActionPreference = 'Stop'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            if ($PSVersionTable.PSEdition -eq 'Desktop') { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
+            Install-Module Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          exit $LASTEXITCODE
+      - name: Ordinary guarded suites
+        shell: pwsh
+        run: |
+          & '${{ matrix.shell }}' -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {
+            & .\tests\Invoke-Tests.ps1 -Path @('.\tests\Invoke-Tests.Tests.ps1', '.\tests\runtime.Tests.ps1', '.\tests\runtime-bootstrap.Tests.ps1', '.\tests\runtime-native.Tests.ps1', '.\tests\runtime-cancel-reset.Tests.ps1', '.\tests\hpcc4-simple.Tests.ps1', '.\tests\completion.Tests.ps1', '.\tests\tools-gpo.Tests.ps1', '.\tests\companions.Tests.ps1') -ResultDirectory .\results\ordinary
+            exit $LASTEXITCODE
+          }
+          exit $LASTEXITCODE
+      - name: Harmless native children only
+        shell: pwsh
+        run: |
+          & '${{ matrix.shell }}' -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {
+            & .\tests\Invoke-Tests.ps1 -Path .\tests\runtime-native-child.Tests.ps1 -ResultDirectory .\results\native-child
+            exit $LASTEXITCODE
+          }
+          exit $LASTEXITCODE
+      - name: Compiler only in fresh x64 process
+        shell: pwsh
+        run: |
+          & '${{ matrix.shell }}' -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command {
+            & .\tests\Invoke-Tests.ps1 -Path .\tests\runtime-compile.Tests.ps1 -ResultDirectory .\results\compiler
+            exit $LASTEXITCODE
+          }
+          exit $LASTEXITCODE
