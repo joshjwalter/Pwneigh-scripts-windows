@@ -1,12 +1,24 @@
-Run the fixture-only suite with Pester **5.9.1** installed in the engine's module path:
+# Guarded native Windows tests
+
+Use Pester **5.9.1**, Windows PowerShell **5.1 x64** first, then PowerShell **7.5+ x64**. The runner fails closed for incomplete, skipped, empty or failed suites and disables Pester's unused HKCU TestRegistry fixture. A fresh process is required for each selection below.
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
-pwsh.exe -NoProfile -NonInteractive -File .\tests\Invoke-Tests.ps1
+.\tests\Invoke-Tests.ps1 -Path @(
+  '.\tests\Invoke-Tests.Tests.ps1', '.\tests\runtime.Tests.ps1',
+  '.\tests\runtime-bootstrap.Tests.ps1', '.\tests\runtime-native.Tests.ps1',
+  '.\tests\runtime-cancel-reset.Tests.ps1', '.\tests\hpcc4-simple.Tests.ps1',
+  '.\tests\completion.Tests.ps1', '.\tests\tools-gpo.Tests.ps1',
+  '.\tests\companions.Tests.ps1'
+) -ResultDirectory .\results\ordinary
+# Separate fresh x64 processes:
+.\tests\Invoke-Tests.ps1 -Path .\tests\runtime-native-child.Tests.ps1 -ResultDirectory .\results\native-child
+.\tests\Invoke-Tests.ps1 -Path .\tests\runtime-compile.Tests.ps1 -ResultDirectory .\results\compiler
 ```
 
-Windows PowerShell 5.1 is primary and PowerShell 7 is secondary. The runner never installs modules. It returns process success only for a nonempty, fully passing suite with no failed containers/blocks, skipped, not-run or inconclusive tests. Optional `-Path` selects a suite; `-ResultDirectory` writes a sanitized count/runtime summary. Dot-source the runner to call `Invoke-Hpcc4Tests` without exiting the caller. The previous `HPCC4_PESTER_RUNNING` flag, scalar global exit state and process TLS are restored in `finally`, including infrastructure errors. Caller preferences are unchanged.
+Never use broad directory discovery on this repository: it mixes the compiler and child graphs. Explicitly launch the selected engine with `-NoProfile -NonInteractive -ExecutionPolicy Bypass`; this is a process-local override. CI uses the same three selections.
 
-Production is only dot-sourced. Mutating account/firewall/service/download/archive/process/registry/history/native commands have throwing defaults and deliberate per-test mocks. Fixture writes use TestDrive; Pester owns TestRegistry infrastructure. Literal appcmd, LGPO, Sysmon and .NET log clearing remain unreachable. Cleanup mocks history inputs/removal and returns empty log enumeration. The only real native production status probes select inbox System32 cmd.exe with fixed `/d /c exit N` arguments. Runner child probes use the current PowerShell engine and harmless TestDrive suites. No production hardening entry point runs against the host.
+Production definitions are pinned and their load AST/guard is checked before tests enter them. Refresh pins only after reviewing changed source and reachable mocked/default-denied leaves. Fixtures use independently verified TestDrive paths with provider/reparse/containment checks; real I/O stays within those bounds. Host-changing natives, ACLs, accounts, registry, services, installers, history/log clearing and deferred deletion remain denied. Module-qualified cmdlet calls can still be intercepted by Pester: fixture reads use guarded CLR I/O to avoid recursive mocks.
 
-The current cleanup policy explicitly refuses directory self-deletion, including existing external paths; unresolved paths fail closed with a manual-removal diagnostic. Exact-file deletion is deferred. Passing these mocks establishes the tested calls, state and refusal behavior; it does not establish effective firewall, ACL, GPO, Sysmon or server behavior.
+The harmless-child suite permits only the selected engine and reviewed inert child bodies, plus an invalid-source reset refusal. The compiler suite compiles actual identity/deferred-removal literals within TestDrive and never invokes their host APIs. Mock success establishes control flow and contracts; live Server enforcement/acceptance remains separate.
+
+The workspace's external original tests were preserved. The repository main suite was migrated from stale name/native-sidecar assumptions to actual SID, effective-policy, committed-record and cleanup interfaces; runtime suites retain the recovered common-mechanics regressions.

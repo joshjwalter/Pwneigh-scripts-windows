@@ -26,6 +26,9 @@ function Invoke-Hpcc4Tests {
         Import-Module -Name Pester -RequiredVersion 5.9.1 -ErrorAction Stop
         Write-Host "Engine: $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion); Pester: $((Get-Module Pester).Version)"
         $configuration = New-PesterConfiguration
+        # These suites use disposable filesystem fixtures and mocked registry
+        # leaves; Pester must not create its implicit HKCU TestRegistry fixture.
+        $configuration.TestRegistry.Enabled = $false
         $configuration.Run.Path = $Path
         $configuration.Run.PassThru = $true
         $configuration.Run.Exit = $false

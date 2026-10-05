@@ -1,7 +1,9 @@
 ﻿BeforeAll {
+    . (Join-Path $PSScriptRoot 'FixtureSafety.ps1')
     $runnerPath = Join-Path $PSScriptRoot 'Invoke-Tests.ps1'
     . $runnerPath
     $runnerEngine = if ($PSVersionTable.PSEdition -eq 'Desktop') { Join-Path $PSHOME 'powershell.exe' } else { Join-Path $PSHOME 'pwsh.exe' }
+    $script:runnerChildCount=0
     $originalFlagExists = Test-Path Env:\HPCC4_PESTER_RUNNING
     $originalFlag = $env:HPCC4_PESTER_RUNNING
     $originalExitExists = $null -ne (Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue)
@@ -12,6 +14,7 @@
     }
 }
 AfterAll {
+    Write-Host "Runner self-test child processes: $runnerChildCount"
     if ($originalFlagExists) { $env:HPCC4_PESTER_RUNNING = $originalFlag } else { Remove-Item Env:\HPCC4_PESTER_RUNNING -ErrorAction SilentlyContinue }
     if ($originalExitExists) { $global:LASTEXITCODE = $originalExitValue } else { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
     [Net.ServicePointManager]::SecurityProtocol = $originalTls
@@ -20,9 +23,11 @@ AfterAll {
 Describe 'Pinned runner child process contract' {
     It 'selects its own directory when no path argument is supplied' {
         $fixtureRunner = Join-Path $TestDrive 'Invoke-Tests.ps1'
-        [IO.File]::WriteAllBytes($fixtureRunner, [IO.File]::ReadAllBytes($runnerPath))
-        [IO.File]::WriteAllText((Join-Path $TestDrive 'default.Tests.ps1'), "Describe 'default suite' { It 'passes' { 1 | Should -Be 1 } }", [Text.UTF8Encoding]::new($true))
-        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $fixtureRunner 2>&1
+        $safeFixture=Assert-FixturePath $fixtureRunner; [IO.File]::WriteAllBytes($safeFixture, [IO.File]::ReadAllBytes($runnerPath))
+        Write-FixtureText (Join-Path $TestDrive 'default.Tests.ps1') "Describe 'default suite' { It 'passes' { 1 | Should -Be 1 } }"
+        if($runnerEngine -notin @((Join-Path $PSHOME 'powershell.exe'),(Join-Path $PSHOME 'pwsh.exe'))){throw 'Untrusted child engine'}
+        $script:runnerChildCount++
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Assert-FixturePath $fixtureRunner) 2>&1
         $childExit = $LASTEXITCODE
         $childExit | Should -Be 0 -Because ($childOutput -join [Environment]::NewLine)
     }
@@ -38,8 +43,10 @@ Describe 'Pinned runner child process contract' {
     ) {
         param($Name, $Body, $Expected)
         $fixture = Join-Path $TestDrive 'synthetic.Tests.ps1'
-        [IO.File]::WriteAllText($fixture, $Body, [Text.UTF8Encoding]::new($true))
-        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runnerPath -Path $fixture 2>&1
+        Write-FixtureText $fixture $Body
+        if($runnerEngine -notin @((Join-Path $PSHOME 'powershell.exe'),(Join-Path $PSHOME 'pwsh.exe'))){throw 'Untrusted child engine'}
+        $script:runnerChildCount++
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $runnerPath -Path (Assert-FixturePath $fixture) 2>&1
         $childExit = $LASTEXITCODE
         $childExit | Should -Be $Expected -Because ($childOutput -join [Environment]::NewLine)
     }
@@ -47,6 +54,7 @@ Describe 'Pinned runner child process contract' {
 
 Describe 'Runner protected exit state in disposable children' {
     BeforeAll {
+    . (Join-Path $PSScriptRoot 'FixtureSafety.ps1')
         $protectedChild = @'
 param([string]$Runner, [string]$Option, [string]$Preference, [string]$FlagState, [switch]$DuringRun)
 . $Runner
@@ -58,7 +66,7 @@ else { Remove-Item Env:\HPCC4_PESTER_RUNNING -ErrorAction SilentlyContinue }
 $script:imports = 0; $script:invokes = 0
 function Import-Module { [CmdletBinding()] param($Name, $RequiredVersion) $script:imports++ }
 function Get-Module { param($Name) [pscustomobject]@{ Version = [version]'5.9.1' } }
-function New-PesterConfiguration { @{ Run = @{}; Output = @{} } }
+function New-PesterConfiguration { @{ Run = @{}; Output = @{}; TestRegistry = @{} } }
 function Invoke-Pester {
     [CmdletBinding()] param($Configuration)
     $script:invokes++
@@ -95,8 +103,10 @@ exit 0
     ) {
         param($Option, $Preference, $FlagState)
         $child = Join-Path $TestDrive 'protected-child.ps1'
-        [IO.File]::WriteAllText($child, $protectedChild, [Text.UTF8Encoding]::new($true))
-        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $child -Runner $runnerPath -Option $Option -Preference $Preference -FlagState $FlagState 2>&1
+        Write-FixtureText $child $protectedChild
+        if($runnerEngine -notin @((Join-Path $PSHOME 'powershell.exe'),(Join-Path $PSHOME 'pwsh.exe'))){throw 'Untrusted child engine'}
+        $script:runnerChildCount++
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Assert-FixturePath $child) -Runner $runnerPath -Option $Option -Preference $Preference -FlagState $FlagState 2>&1
         $childExit = $LASTEXITCODE
         $childExit | Should -Be 0
         $observation = ($childOutput | Where-Object { "$_".StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
@@ -120,8 +130,10 @@ exit 0
     ) {
         param($Option, $Preference)
         $child = Join-Path $TestDrive 'protected-child.ps1'
-        [IO.File]::WriteAllText($child, $protectedChild, [Text.UTF8Encoding]::new($true))
-        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $child -Runner $runnerPath -Option $Option -Preference $Preference -FlagState sentinel -DuringRun 2>&1
+        Write-FixtureText $child $protectedChild
+        if($runnerEngine -notin @((Join-Path $PSHOME 'powershell.exe'),(Join-Path $PSHOME 'pwsh.exe'))){throw 'Untrusted child engine'}
+        $script:runnerChildCount++
+        $childOutput = & $runnerEngine -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Assert-FixturePath $child) -Runner $runnerPath -Option $Option -Preference $Preference -FlagState sentinel -DuringRun 2>&1
         $childExit = $LASTEXITCODE
         $childExit | Should -Be 0
         $observation = ($childOutput | Where-Object { "$_".StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
@@ -143,6 +155,8 @@ exit 0
 
 Describe 'Runner restores environment and refuses incomplete results in process' {
     BeforeEach {
+        Mock New-Item {New-FixtureDirectory $Path}
+        Mock Set-Content {Write-FixtureText $LiteralPath ([string]($Value -join [Environment]::NewLine))}
         $script:fakeResult = New-FakePesterResult
         Mock Import-Module -ParameterFilter { $Name -eq 'Pester' } { }
         Mock Invoke-Pester { $script:fakeResult }

@@ -1,51 +1,40 @@
 name: Windows tests
-
 on:
   push:
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
-  windows-powershell:
-    name: Windows PowerShell 5.1 (primary)
+  windows:
+    name: ${{ matrix.shell }} / Pester 5.9.1
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Install pinned Pester
-        shell: powershell
+        shell: ${{ matrix.shell }}
         run: |
           $ErrorActionPreference = 'Stop'
           [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+          if ($PSVersionTable.PSEdition -eq 'Desktop') { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
           Install-Module Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
-          Import-Module Pester -RequiredVersion 5.9.1 -ErrorAction Stop
-      - name: Run tests
-        shell: powershell
+      - name: Ordinary guarded suites
+        shell: ${{ matrix.shell }}
         run: |
-          & .\tests\Invoke-Tests.ps1
-          $testExit = $LASTEXITCODE
-          exit $testExit
-
-  powershell-core:
-    name: PowerShell 7 (secondary)
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
-        with:
-          persist-credentials: false
-      - name: Install pinned Pester
-        shell: pwsh
+          & .\tests\Invoke-Tests.ps1 -Path @('.\tests\Invoke-Tests.Tests.ps1', '.\tests\runtime.Tests.ps1', '.\tests\runtime-bootstrap.Tests.ps1', '.\tests\runtime-native.Tests.ps1', '.\tests\runtime-cancel-reset.Tests.ps1', '.\tests\hpcc4-simple.Tests.ps1', '.\tests\completion.Tests.ps1', '.\tests\tools-gpo.Tests.ps1', '.\tests\companions.Tests.ps1') -ResultDirectory .\results\ordinary
+          exit $LASTEXITCODE
+      - name: Harmless native children only
+        shell: ${{ matrix.shell }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          Install-Module Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
-          Import-Module Pester -RequiredVersion 5.9.1 -ErrorAction Stop
-      - name: Run tests
-        shell: pwsh
+          & .\tests\Invoke-Tests.ps1 -Path .\tests\runtime-native-child.Tests.ps1 -ResultDirectory .\results\native-child
+          exit $LASTEXITCODE
+      - name: Compiler only in fresh x64 process
+        shell: ${{ matrix.shell }}
         run: |
-          & .\tests\Invoke-Tests.ps1
-          $testExit = $LASTEXITCODE
-          exit $testExit
+          & .\tests\Invoke-Tests.ps1 -Path .\tests\runtime-compile.Tests.ps1 -ResultDirectory .\results\compiler
+          exit $LASTEXITCODE

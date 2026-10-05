@@ -1,114 +1,93 @@
-# watch-hpcc4.ps1 - READ-ONLY live change monitor. Test/dev tool only; never run it against the actual scored box.
-# It never changes anything: it polls system state on an interval and prints every change the moment it's detected,
-# then prints a full BEFORE/AFTER table comparing the very first snapshot to the last one when you stop it.
-#
-# Usage: run this FIRST, in its own window, before running hpcc4-simple.ps1 or reset-hpcc4.ps1 elsewhere:
-#   .\watch-hpcc4.ps1
-#   .\watch-hpcc4.ps1 -IntervalSeconds 1 -MainScript C:\path\to\your-copy.ps1
-#   .\watch-hpcc4.ps1 -DurationSeconds 300   # stop automatically after 5 minutes instead of Ctrl+C
-#
-# It reads the same tunables ($OutDir, $ToolsDir, $LockPaths) from hpcc4-simple.ps1, the same way reset-hpcc4.ps1
-# does, and reuses its read-only helpers (Get-ListeningPorts, Test-EveryoneDeny) instead of reimplementing them.
-#
-# Poll-based, not event-based: a change made and then reverted within one interval can be missed by the live feed -
-# it would only show in the BEFORE/AFTER table if the end state actually differs from the very first snapshot.
-# Read-only, so it does not require elevation, but some registry/firewall reads return more complete results when
-# run elevated - run it as Administrator if you can.
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseCompatibleCommands', 'Write-Log', Justification = 'Defined in hpcc4-simple.ps1')]
-param([string]$MainScript = '', [int]$IntervalSeconds = 2, [int]$DurationSeconds = 0)
-if (-not $MainScript) { $MainScript = Join-Path $PSScriptRoot 'hpcc4-simple.ps1' }
-if (-not (Test-Path $MainScript)) { Write-Host "Can't find $MainScript. Put this file next to hpcc4-simple.ps1, or run: .\watch-hpcc4.ps1 -MainScript <path to it>." -ForegroundColor Red; exit 1 }
-if (-not (Select-String -Path $MainScript -SimpleMatch '# HPCC4-SIMPLE-SCRIPT v1' -Quiet)) {
-    Write-Host "$MainScript doesn't look like hpcc4-simple.ps1 (missing its identity marker). Nothing watched." -ForegroundColor Red; exit 1
+﻿# Read-only polling companion. Uses the trusted original main script's final
+# interfaces. Transient changes and same-metadata changes can be missed.
+param([string]$MainScript='',[int]$IntervalSeconds=2,[int]$DurationSeconds=0,[string[]]$CriticalHashPaths=@(),[long]$HashByteBudget=67108864)
+function Read-WatchCategory {
+    param([scriptblock]$Action)
+    try{
+        $rows=@(& $Action);$seen=@{}
+        foreach($row in $rows){if(-not $row.Key -or $seen.ContainsKey([string]$row.Key)){throw 'Ambiguous identity'};$seen[[string]$row.Key]=$true}
+        [pscustomobject]@{Status='Complete';Items=[object[]]@($rows | Sort-Object Key);Errors=@();ObservedAtUtc=[datetime]::UtcNow.ToString('o')}
+    }catch{[pscustomobject]@{Status='Failed';Items=[object[]]@();Errors=@('ObservationFailed');ObservedAtUtc=[datetime]::UtcNow.ToString('o')}}
 }
-. $MainScript   # loads tunables and read-only helpers only; the guard at its end stops it from running
-
-function Write-Change { param([string]$Line) Write-Host "$(Get-Date -Format 'HH:mm:ss') $Line" -ForegroundColor Yellow }
-
-# One point-in-time read of everything hpcc4-simple.ps1 / reset-hpcc4.ps1 can touch.
 function Get-Snapshot {
-    $s = [ordered]@{}
-    $s.Users = @(Get-LocalUser -ErrorAction SilentlyContinue | Select-Object Name, @{n = 'SID'; e = { $_.SID.Value } }, Enabled, PasswordLastSet)
-    $s.FirewallProfiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Select-Object Name, Enabled, DefaultInboundAction)
-    $s.FirewallRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Select-Object Name, Action, Enabled)
-    $s.Services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, State, StartMode)
-    $s.Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Select-Object @{n = 'Key'; e = { "$($_.TaskPath)$($_.TaskName)" } }, State)
-    $s.Registry = [ordered]@{
-        'RDP NLA (policy)'                = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
-        'RDP NLA (control)'                = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -ErrorAction SilentlyContinue).UserAuthentication
-        'WDigest UseLogonCredential'       = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name UseLogonCredential -ErrorAction SilentlyContinue).UseLogonCredential
-        'SMB1 enabled'                     = $(try { (Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol } catch { $null })
-        'SMB signing required'             = $(try { (Get-SmbServerConfiguration -ErrorAction Stop).RequireSecuritySignature } catch { $null })
-        'Guest (RID 501) enabled'          = (Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { ($_.SID.Value -split '-')[-1] -eq 501 } | Select-Object -ExpandProperty Enabled)
-        'Administrator (RID 500) name'     = (Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { ($_.SID.Value -split '-')[-1] -eq 500 } | Select-Object -ExpandProperty Name)
-        'Administrator (RID 500) enabled'  = (Get-LocalUser -ErrorAction SilentlyContinue | Where-Object { ($_.SID.Value -split '-')[-1] -eq 500 } | Select-Object -ExpandProperty Enabled)
-        'AllowLocalPolicyMerge (Domain)'   = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile' -Name AllowLocalPolicyMerge -ErrorAction SilentlyContinue).AllowLocalPolicyMerge
-        'AllowLocalPolicyMerge (Private)'  = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile' -Name AllowLocalPolicyMerge -ErrorAction SilentlyContinue).AllowLocalPolicyMerge
-        'AllowLocalPolicyMerge (Public)'   = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile' -Name AllowLocalPolicyMerge -ErrorAction SilentlyContinue).AllowLocalPolicyMerge
-        'Machine PATH'                     = (Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-        'Sysinternals EULA accepted'       = (Get-ItemProperty 'HKCU:\Software\Sysinternals' -Name EulaAccepted -ErrorAction SilentlyContinue).EulaAccepted
+    param([string[]]$CriticalHashPaths=@(),[long]$HashByteBudget=67108864)
+    $categories=[ordered]@{}
+    $categories.Users=Read-WatchCategory {foreach($u in @(Get-LocalUser -ErrorAction Stop)){[pscustomobject]@{Key=[string]$u.SID;Value=@{Name=[string]$u.Name;Enabled=[bool]$u.Enabled;PasswordLastSet=$u.PasswordLastSet}}}}
+    $categories.Firewall=Read-WatchCategory {
+        $read=Get-FirewallSnapshot;if($read.Status -ne 'Complete'){throw 'Firewall incomplete'}
+        foreach($p in $read.Items[0].Profiles){[pscustomobject]@{Key='Profile|'+$p.Name;Value=@{Enabled=[string]$p.Enabled;DefaultInboundAction=[string]$p.DefaultInboundAction;AllowLocalFirewallRules=[string]$p.AllowLocalFirewallRules}}}
+        foreach($r in $read.Items[0].Rules){[pscustomobject]@{Key=$r.Source+'|'+$r.Name;Value=@{Enabled=$r.Enabled;Direction=$r.Direction;Action=$r.Action;Profile=$r.Profile;Port=$r.Port;Address=$r.Address;Application=$r.Application;Service=$r.Service;Interface=$r.Interface;Security=$r.Security}}}
     }
-    $s.LockedPaths = [ordered]@{}
-    foreach ($p in @($LockPaths)) { $s.LockedPaths[$p] = if (Test-Path $p -ErrorAction SilentlyContinue) { Test-EveryoneDeny $p } else { $null } }
-    $s.ListeningPorts = @(Get-ListeningPorts | ForEach-Object { "$($_.Proto):$($_.Port)" })
-    $s.OutDirFiles = if (Test-Path $OutDir) { @(Get-ChildItem $OutDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName) } else { @() }
-    $s.ToolsDirFiles = if (Test-Path $ToolsDir) { @(Get-ChildItem $ToolsDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName) } else { @() }
-    $s.Sysmon = [bool](Get-Service Sysmon64, Sysmon -ErrorAction SilentlyContinue)
-    $s
-}
-
-# Generic diffs, reused across every category above instead of one bespoke comparison per category.
-function Compare-KeyedList {
-    param([string]$Label, [array]$Before, [array]$After, [string]$KeyProp, [string[]]$WatchProps)
-    $beforeMap = @{}; foreach ($i in $Before) { $beforeMap[$i.$KeyProp] = $i }
-    $afterMap = @{}; foreach ($i in $After) { $afterMap[$i.$KeyProp] = $i }
-    foreach ($k in $afterMap.Keys) {
-        if (-not $beforeMap.ContainsKey($k)) { Write-Change "$Label ADDED: $k"; continue }
-        foreach ($p in $WatchProps) {
-            $b = $beforeMap[$k].$p; $a = $afterMap[$k].$p
-            if ("$b" -ne "$a") { Write-Change "$Label CHANGED: $k -> $p ($b -> $a)" }
+    $categories.Services=Read-WatchCategory {foreach($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)){[pscustomobject]@{Key=$s.Name;Value=@{State=$s.State;StartMode=$s.StartMode;PathName=$s.PathName;StartName=$s.StartName}}}}
+    $categories.Tasks=Read-WatchCategory {foreach($t in @(Get-ScheduledTask -ErrorAction Stop)){[pscustomobject]@{Key=$t.TaskPath+$t.TaskName;Value=@{State=[string]$t.State;Principal=$t.Principal;Settings=$t.Settings;Triggers=@($t.Triggers);Actions=@($t.Actions)}}}}
+    $categories.Registry=Read-WatchCategory {
+        foreach($entry in @(@('HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment','Path'),@('HKCU:\Software\Sysinternals','EulaAccepted'),@('HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services','UserAuthentication'),@('HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest','UseLogonCredential'))){[pscustomobject]@{Key=$entry -join '|';Value=(Get-RawRegistryValue $entry[0] $entry[1])}}
+    }
+    $categories.LockedPaths=Read-WatchCategory {foreach($p in $LockPaths){[pscustomobject]@{Key=$p;Value=(Get-CFileObservation $p)}}}
+    $categories.Listeners=Read-WatchCategory {$read=Get-ListeningPorts;if($read.Status -ne 'Complete'){throw 'Listeners incomplete'};foreach($p in $read.Items){[pscustomobject]@{Key="$($p.Proto):$($p.Port)";Value=$p}}}
+    $categories.Storage=Read-WatchCategory {
+        foreach($path in @($OutDir,$ToolsDir)){
+            if(Test-Path -LiteralPath $path){$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop;[pscustomobject]@{Key=$path;Value=@{Exists=$true;Attributes=[int]$item.Attributes;LastWriteTimeUtc=$item.LastWriteTimeUtc}}}
+            else{[pscustomobject]@{Key=$path;Value=@{Exists=$false}}}
         }
     }
-    foreach ($k in $beforeMap.Keys) { if (-not $afterMap.ContainsKey($k)) { Write-Change "$Label REMOVED: $k" } }
-}
-function Compare-Set {
-    param([string]$Label, [string[]]$Before, [string[]]$After)
-    @($After | Where-Object { $Before -notcontains $_ }) | ForEach-Object { Write-Change "$Label ADDED: $_" }
-    @($Before | Where-Object { $After -notcontains $_ }) | ForEach-Object { Write-Change "$Label REMOVED: $_" }
-}
-function Compare-Scalars {
-    param([string]$Label, [System.Collections.IDictionary]$Before, [System.Collections.IDictionary]$After)
-    foreach ($k in $After.Keys) { $b = $Before[$k]; $a = $After[$k]; if ("$b" -ne "$a") { Write-Change "$Label`: $k ($b -> $a)" } }
+    $remaining=$HashByteBudget
+    $categories.CriticalHashes=Read-WatchCategory {
+        if($CriticalHashPaths.Count -gt 32){throw 'Hash path limit'}
+        foreach($path in $CriticalHashPaths){
+            $path=Get-CanonicalFilePath $path -MustExist;$item=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+            if($item.PSIsContainer -or $item.Attributes -band 1024 -or $item.Length -gt 16777216 -or $item.Length -gt $remaining){throw 'Hash coverage incomplete/budget exceeded'}
+            $remaining-=$item.Length
+            [pscustomobject]@{Key=$path;Value=@{Length=[long]$item.Length;LastWriteTimeUtc=$item.LastWriteTimeUtc;Digest=(Get-NativeFileDigest $path)}}
+        }
+    }
+    [pscustomobject]@{ObservedAtUtc=[datetime]::UtcNow.ToString('o');Categories=$categories}
 }
 function Compare-Snapshots {
-    param($Before, $After)
-    Compare-KeyedList 'USER' $Before.Users $After.Users 'Name' @('Enabled', 'PasswordLastSet')
-    Compare-KeyedList 'FIREWALL PROFILE' $Before.FirewallProfiles $After.FirewallProfiles 'Name' @('Enabled', 'DefaultInboundAction')
-    Compare-KeyedList 'FIREWALL RULE' $Before.FirewallRules $After.FirewallRules 'Name' @('Action', 'Enabled')
-    Compare-KeyedList 'SERVICE' $Before.Services $After.Services 'Name' @('State', 'StartMode')
-    Compare-KeyedList 'SCHEDULED TASK' $Before.Tasks $After.Tasks 'Key' @('State')
-    Compare-Scalars 'REGISTRY' $Before.Registry $After.Registry
-    Compare-Scalars 'ACL LOCK' $Before.LockedPaths $After.LockedPaths
-    Compare-Set 'LISTENING PORT' $Before.ListeningPorts $After.ListeningPorts
-    Compare-Set 'OUTDIR FILE' $Before.OutDirFiles $After.OutDirFiles
-    Compare-Set 'TOOLSDIR FILE' $Before.ToolsDirFiles $After.ToolsDirFiles
-    if ($Before.Sysmon -ne $After.Sysmon) { Write-Change "SYSMON installed: $($Before.Sysmon) -> $($After.Sysmon)" }
-}
-
-Write-Log "watch-hpcc4: watching against $MainScript's tunables (OutDir=$OutDir, ToolsDir=$ToolsDir, LockPaths=$($LockPaths -join ', ')). Polling every ${IntervalSeconds}s. Ctrl+C to stop and print the BEFORE/AFTER summary."
-$first = Get-Snapshot
-$prev = $first
-$startedAt = Get-Date
-try {
-    while ($true) {
-        if ($DurationSeconds -gt 0 -and ((Get-Date) - $startedAt).TotalSeconds -ge $DurationSeconds) { break }
-        Start-Sleep -Seconds $IntervalSeconds
-        $cur = Get-Snapshot
-        Compare-Snapshots $prev $cur
-        $prev = $cur
+    param($Before,$After,[hashtable]$LastGood=@{})
+    $changes=@()
+    foreach($name in $After.Categories.Keys){
+        $current=$After.Categories[$name]
+        if($current.Status -ne 'Complete'){$changes+=[pscustomobject]@{Category=$name;Kind='Gap';Key='';Before=$null;After=$current.Status;ObservedAtUtc=$current.ObservedAtUtc};continue}
+        $prior=if($LastGood.ContainsKey($name)){$LastGood[$name]}else{$Before.Categories[$name]}
+        if($prior -and $prior.Status -eq 'Complete'){
+            $old=@{};$new=@{};foreach($row in $prior.Items){$old[$row.Key]=$row.Value};foreach($row in $current.Items){$new[$row.Key]=$row.Value}
+            foreach($key in @(@($old.Keys)+@($new.Keys) | Sort-Object -Unique)){
+                $kind=if(-not $old.ContainsKey($key)){'Added'}elseif(-not $new.ContainsKey($key)){'Removed'}elseif(-not(Test-DataEqual $old[$key] $new[$key])){'Changed'}else{''}
+                if($kind){$changes+=[pscustomobject]@{Category=$name;Kind=$kind;Key=$key;Before=$old[$key];After=$new[$key];ObservedAtUtc=$current.ObservedAtUtc}}
+            }
+        }
+        $LastGood[$name]=$current
     }
-} finally {
-    Write-Log '--- BEFORE / AFTER SUMMARY (first snapshot vs. right now) ---'
-    Compare-Snapshots $first $prev
-    Write-Log '--- end summary (nothing printed above means nothing changed since watch-hpcc4.ps1 started) ---'
+    return $changes
 }
+function Invoke-Hpcc4Watch {
+    param([string]$MainScript,[int]$IntervalSeconds=2,[int]$DurationSeconds=0,[string[]]$CriticalHashPaths=@(),[long]$HashByteBudget=67108864)
+    if($IntervalSeconds -lt 1 -or $IntervalSeconds -gt 3600 -or $DurationSeconds -lt 0 -or $DurationSeconds -gt 86400 -or $HashByteBudget -lt 0 -or $HashByteBudget -gt 268435456){throw 'Invalid polling/hash limits'}
+    if(-not $MainScript){$MainScript=Join-Path $PSScriptRoot 'hpcc4-simple.ps1'}
+    $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile([IO.Path]::GetFullPath($MainScript),[ref]$t,[ref]$e)
+    if($e.Count -or $ast.Extent.Text -notmatch '(?m)^# HPCC4-SIMPLE-SCRIPT v1 ' -or $ast.EndBlock.Statements[-1].Extent.Text -ne 'if ($MyInvocation.InvocationName -ne ''.'') { Invoke-DirectEntry }'){throw 'Unsupported trusted original source'}
+    foreach($statement in $ast.EndBlock.Statements | Select-Object -SkipLast 1){
+        if($statement -is [Management.Automation.Language.FunctionDefinitionAst]){continue}
+        if($statement -isnot [Management.Automation.Language.AssignmentStatementAst] -or @($statement.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst]},$true)).Count){throw 'Unsupported source load'}
+        $commands=@($statement.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))
+        if($commands.Count -and ($commands.Count -ne 1 -or $commands[0].GetCommandName() -ne 'New-RunState' -or $statement.Left.Extent.Text -ne '$null')){throw 'Unsupported source action'}
+    }
+    . $MainScript
+    $first=Get-Snapshot $CriticalHashPaths $HashByteBudget;$previous=$first;$good=@{};$baselineGood=@{}
+    foreach($name in $first.Categories.Keys){if($first.Categories[$name].Status -eq 'Complete'){$good[$name]=$first.Categories[$name];$baselineGood[$name]=$first.Categories[$name]}}
+    $clock=[Diagnostics.Stopwatch]::StartNew();$final=$null
+    try{
+        while(-not $DurationSeconds -or $clock.Elapsed.TotalSeconds -lt $DurationSeconds){
+            Start-Sleep -Seconds $IntervalSeconds;$current=Get-Snapshot $CriticalHashPaths $HashByteBudget
+            Compare-Snapshots $previous $current $good | ForEach-Object {Write-Host (ConvertTo-Json -InputObject $_ -Compress -Depth 20)};$previous=$current
+        }
+    }finally{
+        $final=Get-Snapshot $CriticalHashPaths $HashByteBudget
+        Write-Host "Final observation at $($final.ObservedAtUtc); failed categories are gaps, last-good observations retain their own timestamp."
+        Compare-Snapshots $first $final $baselineGood | ForEach-Object {Write-Host (ConvertTo-Json -InputObject $_ -Compress -Depth 20)}
+        $clock.Stop()
+    }
+    [pscustomobject]@{First=$first;Final=$final;LastGood=$good}
+}
+if ($MyInvocation.InvocationName -ne '.') { Invoke-Hpcc4Watch $MainScript $IntervalSeconds $DurationSeconds $CriticalHashPaths $HashByteBudget }
