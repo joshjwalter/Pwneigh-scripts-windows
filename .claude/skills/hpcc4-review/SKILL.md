@@ -28,7 +28,7 @@ Before recommending or helping run it for real (not `-DryRun`), check:
      run can lock them out.
 2. **A `-DryRun` pass has been run first** and its output reviewed, unless the user explicitly
    says they've already done that for this exact tunables configuration.
-3. **If `$DodGpoDir`/`$LgpoExe` are set**, remind the user to follow up with the
+3. **If `$ApplyStigGpo`/`$ApplyDefenderStig` are on**, remind the user to follow up with the
    `gpo-verify` skill / `gpo-verification-checklist.md` afterward — GPO application isn't
    verified by the script itself.
 4. **If this is being run against a machine the user is remoted into**, flag the `$KeepOpenTcp`

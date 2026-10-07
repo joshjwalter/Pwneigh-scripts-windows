@@ -7,6 +7,9 @@ read access to the box has to actually reverse-engineer it instead of just readi
    [ ] watch-hpcc4.ps1              - test/dev-only monitor, never touches the scored box
    [ ] .claude/ (whole directory)   - hooks, skills, agent defs, settings.json - Claude Code tooling only
    [ ] gpo-verification-checklist.md - tells a reader exactly which STIG settings you rely on / skipped
+   [ ] stig-package-guide.md        - same: which GPOs you applied, skipped and edited
+   [ ] build-gpo-bundle.ps1         - dev-box only; shows every STIG line removed
+   [ ] gpo-bundle\CHANGES.md        - names the renamed admin account. Only gpo-bundle\zip\ goes in the tools zip
    [ ] .git/                        - full uncompiled version history; do not bundle if packaging/compiling
 
 2. STRIP FROM hpcc4-simple.ps1 AND reset-hpcc4.ps1
@@ -30,11 +33,14 @@ read access to the box has to actually reverse-engineer it instead of just readi
    [ ] Run the result through Invoke-Obfuscation (the standard PowerShell obfuscator) rather than
        relying on an EXE wrapper alone
    [ ] Only THEN compile/package the obfuscated build if still wanted, as the very last step
+   [ ] WARNING: the Defender STIG's ASR rule "block execution of potentially obfuscated scripts" is in
+       block mode. The script runs BEFORE the GPO on a fresh box, but a re-run after it will likely be
+       blocked. Test the obfuscated build on a VM that already has the Defender STIG applied
 
 5. FINAL CHECKS BEFORE COPYING TO THE BOX
    [ ] Diff the stripped/obfuscated build's behavior against the real source on a test VM - same
        Invoke-Step call order, same tunables, nothing silently changed by the rename/strip pass
    [ ] Confirm the tunables ($AuthorizedUsers, $AllowTcp/$AllowUdp, $KeepOpenTcp, $ExcludeUsers,
-       $DodGpoDir, etc.) are filled in for THIS competition, not left over from testing
+       $ApplyStigGpo/$ApplyDefenderStig, etc.) are filled in for THIS competition, not left over from testing
    [ ] Keep the real, commented source (this repo) as your actual working copy for next time -
        never overwrite it with the stripped build

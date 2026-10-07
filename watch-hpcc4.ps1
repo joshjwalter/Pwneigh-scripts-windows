@@ -29,7 +29,7 @@ function Write-Change { param([string]$Line) Write-Host "$(Get-Date -Format 'HH:
 function Get-Snapshot {
     $s = [ordered]@{}
     $s.Users = @(Get-LocalUser -ErrorAction SilentlyContinue | Select-Object Name, @{n = 'SID'; e = { $_.SID.Value } }, Enabled, PasswordLastSet)
-    $s.FirewallProfiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Select-Object Name, Enabled, DefaultInboundAction)
+    $s.FirewallProfiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction)
     $s.FirewallRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Select-Object Name, Action, Enabled)
     $s.Services = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, State, StartMode)
     $s.Tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Select-Object @{n = 'Key'; e = { "$($_.TaskPath)$($_.TaskName)" } }, State)
@@ -83,7 +83,7 @@ function Compare-Scalars {
 function Compare-Snapshots {
     param($Before, $After)
     Compare-KeyedList 'USER' $Before.Users $After.Users 'Name' @('Enabled', 'PasswordLastSet')
-    Compare-KeyedList 'FIREWALL PROFILE' $Before.FirewallProfiles $After.FirewallProfiles 'Name' @('Enabled', 'DefaultInboundAction')
+    Compare-KeyedList 'FIREWALL PROFILE' $Before.FirewallProfiles $After.FirewallProfiles 'Name' @('Enabled', 'DefaultInboundAction', 'DefaultOutboundAction')
     Compare-KeyedList 'FIREWALL RULE' $Before.FirewallRules $After.FirewallRules 'Name' @('Action', 'Enabled')
     Compare-KeyedList 'SERVICE' $Before.Services $After.Services 'Name' @('State', 'StartMode')
     Compare-KeyedList 'SCHEDULED TASK' $Before.Tasks $After.Tasks 'Key' @('State')

@@ -1,5 +1,4 @@
-# PreToolUse hook: flag edits to hpcc4-simple.ps1's tunables block ($KeepOpenTcp .. $DisableServices,
-# roughly lines 5-26) for extra review, since a bad tunable can delete the wrong accounts, reset the
+# PreToolUse hook: flag edits to hpcc4-simple.ps1's tunables (the settings block at the top) for extra review, since a bad tunable can delete the wrong accounts, reset the
 # wrong passwords, or lock the operator out. Does not block - asks for confirmation instead.
 $ErrorActionPreference = 'Stop'
 $input_ = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -15,22 +14,15 @@ $marker = '# HPCC4-SIMPLE-SCRIPT v1'
 $isMainScript = if ($toolName -eq 'Write') { "$($input_.tool_input.content)" -match [regex]::Escape($marker) } else { (Test-Path $filePath) -and (Select-String -Path $filePath -SimpleMatch $marker -Quiet) }
 if (-not $isMainScript) { exit 0 }
 
-$tunableNames = @(
-    'KeepOpenTcp', 'AllowTcp', 'AllowUdp', 'BlockTcp', 'BlockUdp',
-    'ExcludeUsers', 'AuthorizedUsers', 'ToolsDir', 'ToolsZip', 'ToolsZipSha256',
-    'AvInstallerUrl', 'AvInstallerExpectedSigner', 'InstallSysmon', 'BackupPaths', 'LockPaths', 'OutDir',
-    'DisableServices', 'DodGpoDir', 'LgpoExe'
-)
-
-$touchesTunable = $false
-if ($toolName -eq 'Write') {
-    $touchesTunable = $true   # full-file rewrite: can't tell what changed, always flag
-} elseif ($toolName -eq 'Edit') {
-    $text = "$($input_.tool_input.old_string)`n$($input_.tool_input.new_string)"
-    $touchesTunable = $tunableNames | Where-Object { $text -match "\`$$_\b" } | Select-Object -First 1
-} elseif ($toolName -eq 'MultiEdit') {
-    $text = ($input_.tool_input.edits | ForEach-Object { "$($_.old_string)`n$($_.new_string)" }) -join "`n"
-    $touchesTunable = $tunableNames | Where-Object { $text -match "\`$$_\b" } | Select-Object -First 1
+# A full-file Write can't be diffed, so it always counts. An edit counts if it mentions a tunable. The tunable names are read
+# from the script itself (every top-level `$Name =` line above `$State =`), so this list can never go stale.
+$touchesTunable = $toolName -eq 'Write'
+if (-not $touchesTunable) {
+    $top = ((Get-Content $filePath -Raw) -split '(?m)^\$State\s*=')[0]
+    $tunableNames = [regex]::Matches($top, '(?m)^\$(\w+)\s*=') | ForEach-Object { $_.Groups[1].Value }
+    $edits = if ($toolName -eq 'MultiEdit') { $input_.tool_input.edits } else { @($input_.tool_input) }
+    $text = ($edits | ForEach-Object { "$($_.old_string)`n$($_.new_string)" }) -join "`n"
+    $touchesTunable = [bool]($tunableNames | Where-Object { $text -match "\`$$_\b" })
 }
 
 if (-not $touchesTunable) { exit 0 }
