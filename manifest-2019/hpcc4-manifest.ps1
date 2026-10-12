@@ -16,7 +16,7 @@ $DisableUsers   = @()
 $ToolsDir       = 'C:\Tools'
 $ToolsZip       = 'https://github.com/joshjwalter/Pwneigh-Tools/archive/refs/heads/main.zip'
 $ToolsZipSha256 = ''
-$AvInstallerUrl = 'https://free.360totalsecurity.com/totalsecurity/360TS_Setup_Mini.exe'
+$AvInstallerUrl = 'https://free.360totalsecurity.com/totalsecurity/360TS_Setup_11.0.0.1314.exe'   # offline installer (~115 MB): installs with no internet
 $InstallSysmon  = $false
 $BackupPaths    = @('C:\Windows\System32\drivers\etc\hosts')
 $LockPaths      = @('C:\Windows\System32\drivers\etc\hosts')
@@ -27,7 +27,7 @@ $ApplyDefenderStig = $false      # off: 360TS is the AV, and two real-time AVs f
 $ProgressPreference = 'SilentlyContinue'; $WarningPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $Start = Get-Date
-$State = @{ Domain = ''; RdpPort = 3389; Purge = $false; FirewallOn = $false; Phases = @(); Failures = @(); Would = @(); Deleted = @(); Disabled = @(); RdpOnly = @(); PwTargets = @(); Changed = @(); OutKept = @(); AvLaunched = $false; Persistence = @() }
+$State = @{ Domain = ''; RdpPort = 3389; Purge = $false; FirewallOn = $false; Phases = @(); Failures = @(); Would = @(); Deleted = @(); Disabled = @(); RdpOnly = @(); PwTargets = @(); Changed = @(); OutKept = @(); Persistence = @() }
 
 function Invoke-Step {
     param([Parameter(Position = 0)][string]$Name, [Parameter(Position = 1)][scriptblock]$Action, [switch]$RobocopyCodes)
@@ -163,15 +163,15 @@ function Set-LocalPasswords {
     foreach ($u in $State.PwTargets) { if (Invoke-Step "password $u" { Set-LocalUser -Name $u -Password $pw }) { $State.Changed += $u } }
     $pw = $null
 }
-# Downloads the AV installer into the admin-only OutDir and opens it right away, so you click through it while the
-# script carries on. Outbound 80/443 stays open until you confirm it's done (at the end of the run).
+# Runs right after the scored ports open, so the big download doesn't keep services down. Downloads the offline AV
+# installer into the admin-only OutDir and opens it; it needs no internet after that, so outbound closes right away.
 function Start-AvInstaller {
     if (-not $AvInstallerUrl) { Skip '$AvInstallerUrl is empty'; return }
     $av = Join-Path $OutDir (Split-Path $AvInstallerUrl -Leaf)
     if (-not (Invoke-Step 'download AV installer' { Invoke-WebRequest $AvInstallerUrl -OutFile $av -UseBasicParsing })) { return }
     $sig = Get-AuthenticodeSignature $av
     if ($sig.Status -ne 'Valid') { $State.Failures += "AV installer signature is $($sig.Status) - NOT opened: $av"; return }
-    if (Invoke-Step "open AV installer (signed by $($sig.SignerCertificate.Subject))" { Start-Process $av }) { $State.AvLaunched = $true }
+    $null = Invoke-Step "open AV installer (signed by $($sig.SignerCertificate.Subject))" { Start-Process $av }
 }
 function Set-RdpNla {
     Invoke-Step 'RDP NLA on' { Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1 -Type DWord }
@@ -381,7 +381,6 @@ try {
     Invoke-Phase 'Disable accounts' { Disable-Accounts }
     Invoke-Phase 'RDP-only users' { Set-RdpOnlyUsers }
     Invoke-Phase 'Change passwords' { Set-LocalPasswords }
-    Invoke-Phase 'Antivirus installer' { Start-AvInstaller }
     Invoke-Phase 'RDP NLA' { Set-RdpNla }
     Invoke-Phase 'Disable services' { Disable-ExtraServices }
     Invoke-Phase 'Persistence report' { Get-PersistenceReport }
@@ -391,7 +390,7 @@ try {
     $done = $true
 } finally {
     Invoke-Phase 'Open scored ports' { Open-ServicePorts }
-    if ($State.AvLaunched) { $null = Read-Host 'Scored ports are open. Finish the 360TS install, then press Enter to close outbound 80/443' }
+    Invoke-Phase 'Antivirus installer' { Start-AvInstaller }
     Invoke-Phase 'Close run-time outbound' { Close-RunOutbound }
     if ($done) { Invoke-Phase 'Cleanup' { Invoke-Cleanup } }
     Write-Summary
