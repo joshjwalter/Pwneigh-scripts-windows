@@ -28,7 +28,7 @@ $DisableServices = @()         # extra services to stop + disable, e.g. 'RemoteR
 # ---- DoD STIG GPO (the bundle from build-gpo-bundle.ps1: LGPO.exe + GPO\ at the tools zip's root, so in $ToolsDir) ----
 $ApplyStigGpo      = $true     # apply the OS baseline matching this box (Server 2012 R2 / 2022 / 2025 member server)
 $ApplyDefenderStig = $true     # apply the Defender STIG (skipped by itself if Defender isn't installed, e.g. 2012 R2)
-$State = @{ IsDC = $false; Domain = ''; RdpPort = 3389; BackupDir = ''; Uncovered = @(); Purge = $false; Enable = $true; FirewallOn = $false; OutboundBlocked = $false; RulesAdded = @(); BlocksRefused = @(); Deleted = @(); Changed = @(); ServicesDisabled = @(); Persistence = @(); GpoApplied = @(); GpoBaseline = ''; ToolsInstalled = $false; HashChecked = 'no'; Locked = @(); Failures = @() }
+$State = @{ Domain = ''; RdpPort = 3389; BackupDir = ''; Purge = $false; Enable = $true; FirewallOn = $false; OutboundBlocked = $false; RulesAdded = @(); Deleted = @(); Changed = @(); ServicesDisabled = @(); Persistence = @(); GpoApplied = @(); GpoBaseline = ''; ToolsInstalled = $false; HashChecked = 'no'; Locked = @(); Failures = @() }
 
 # ---- Helpers ----
 function Write-Log { param([string]$Message); Write-Host "$(Get-Date -Format 'HH:mm:ss') $Message" }   # terminal only; nothing is written to disk
@@ -48,8 +48,7 @@ function Invoke-Step {
     } catch { Write-Log "FAILED: ${Name}: $($_.Exception.Message)" }
     $State.Failures += $Name; return $false
 }
-function Test-IsAdmin { (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
-function ConvertFrom-SecureText { param([Security.SecureString]$Secure); $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } }
+function Test-IsAdmin { (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }   # used by reset-hpcc4.ps1
 # Restricts a folder to Administrators + SYSTEM full control (plus any extra grant), removing inherited permissions.
 # Shared by Initialize-Setup ($OutDir) and Install-Tools ($ToolsDir) so the lockdown ACL is defined in exactly one place.
 function Lock-AdminOnlyAcl {
@@ -59,36 +58,14 @@ function Lock-AdminOnlyAcl {
 
 # ---- Accounts ----
 function Get-LocalEnabledUsers { (Get-LocalUser | Where-Object Enabled).Name }
-# Accounts that services, IIS app pools and scheduled tasks run as. Changing their passwords would break them.
-function Get-InUseAccounts {
-    (Get-CimInstance -ClassName Win32_Service).StartName
-    $appcmd = "$env:windir\system32\inetsrv\appcmd.exe"; if (Test-Path $appcmd) { & $appcmd list apppool /text:processModel.userName }
-    (Get-ScheduledTask).Principal.UserId
-}
-# Names that must never be deleted or password-reset: you, $ExcludeUsers, and accounts services/tasks run as. Re-queries
-# Get-InUseAccounts fresh on every call (deliberately NOT cached): Set-FirewallLockdown's uncovered-ports prompt and the
-# delete/password confirmation prompts below can each block on the operator for an arbitrary time, and a stale snapshot
-# taken before those prompts could let a newly-in-use account get deleted or password-reset by the time this runs.
-# '.\bob', 'HOST\bob' and 'CORP\bob' all normalize to 'bob'; -contains/-notcontains below are case-insensitive.
-# Shared by Get-PasswordTargets and Remove-UnauthorizedUsers so both protect exactly the same accounts.
-function Get-ProtectedAccountNames {
-    @($ExcludeUsers) + @(Get-InUseAccounts) + $env:USERNAME | Where-Object { $_ } | ForEach-Object { $_ -replace '^.*\\' } | Select-Object -Unique
-}
-function Get-PasswordTargets {
-    $skip = @(Get-ProtectedAccountNames)
-    @(Get-LocalEnabledUsers) | Where-Object { $skip -notcontains $_ }
-}
+# Every enabled local account except $ExcludeUsers. Service, app-pool and task accounts are NOT protected.
+function Get-PasswordTargets { @(Get-LocalEnabledUsers) | Where-Object { @($ExcludeUsers) -notcontains $_ } }
 
 # ---- Firewall ----
 function Get-ListeningPorts {
     $proc = @{ n = 'Process'; e = { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name } }
     @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object @{ n = 'Proto'; e = { 'TCP' } }, @{ n = 'Port'; e = { [int]$_.LocalPort } }, $proc) +
     @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Select-Object @{ n = 'Proto'; e = { 'UDP' } }, @{ n = 'Port'; e = { [int]$_.LocalPort } }, $proc) | Sort-Object Proto, Port -Unique
-}
-# Ports that already have an enabled inbound allow rule, e.g. 'TCP:80'. Only single port numbers count (not ranges or Any): it may over-warn, never under-warn.
-function Get-InboundAllowPorts {
-    Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction SilentlyContinue | Get-NetFirewallPortFilter |
-        ForEach-Object { $proto = "$($_.Protocol)".ToUpper(); @($_.LocalPort) -match '^\d+$' | ForEach-Object { "${proto}:$_" } }
 }
 # Ports open for the whole run: the live RDP port plus $KeepOpenTcp. Their rules are named HPCC4-Keep-TCP-<port>.
 function Get-KeepPorts { @(@($State.RdpPort) + @($KeepOpenTcp) | ForEach-Object { [int]$_ } | Select-Object -Unique) }
@@ -127,25 +104,12 @@ function Get-OutboundAllowHosts {
     }
     @(@($AllowOutHosts) + $dcs | Where-Object { $_ } | Select-Object -Unique)
 }
-# Live outbound TCP connections the lockdown would cut: not loopback, not an inbound session on one of our listening ports
-# (RDP, SSH, a scored service), not to an allowed port or host. Exact host IPs only (subnets aren't expanded): it may
-# over-warn, never under-warn. Each one is a scored dependency you forgot (web -> DB) or something that shouldn't be there.
-function Get-UncoveredOutbound {
-    param([string[]]$AllowHosts)
-    $listen = @(Get-ListeningPorts | Where-Object { $_.Proto -eq 'TCP' } | ForEach-Object { $_.Port })
-    Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object {
-        $_.RemoteAddress -notmatch '^(::ffff:)?127\.|^::1$' -and $listen -notcontains [int]$_.LocalPort -and
-        @($AllowOutTcp) -notcontains [int]$_.RemotePort -and @($AllowHosts) -notcontains $_.RemoteAddress
-    } | Select-Object @{ n = 'Remote'; e = { "$($_.RemoteAddress):$($_.RemotePort)" } }, @{ n = 'Process'; e = { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).Name } } |
-        Sort-Object Remote -Unique
-}
 
 # ---- Steps, in run order ----
 function Initialize-Setup {
     $rdp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name PortNumber -ErrorAction SilentlyContinue).PortNumber
     $State.RdpPort = if ($rdp) { [int]$rdp } else { 3389 }
     $cs = Get-CimInstance -ClassName Win32_ComputerSystem
-    $State.IsDC = $cs.DomainRole -in 4, 5
     $State.Domain = if ($cs.PartOfDomain) { $cs.Domain } else { '' }   # member servers need outbound to their DCs
     Invoke-Step 'create OutDir' { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
     Invoke-Step 'lock down OutDir' { Lock-AdminOnlyAcl $OutDir }
@@ -162,40 +126,17 @@ function Backup-Targets {
     if (Test-Path $wfw) { Write-Log 'firewall-before.wfw exists, keeping the original' } else { Invoke-Step 'export firewall' { netsh advfirewall export $wfw } }
 }
 # Start of run: close every inbound port except RDP, $KeepOpenTcp and DHCP. Service ports reopen in Open-ServicePorts at the end.
-# Purging old rules and switching to default-block are separate decisions: skipping one for safety doesn't require skipping the other.
 function Set-FirewallLockdown {
-    $keep = Get-KeepPorts; $State.Enable = $true; $State.Purge = $true; $block = $true
-    if ($State.IsDC) {
-        $State.Purge = $false; $block = $false
-        Write-Log 'WARNING: domain controller - NOT removing existing firewall rules and NOT switching to default-block (AD needs dynamic RPC ports).'
-    } elseif (-not $DryRun -and -not (Test-Path (Join-Path $OutDir 'firewall-before.wfw'))) {
-        $State.Purge = $false
-        Write-Log 'WARNING: no firewall backup (firewall-before.wfw) - NOT removing existing firewall rules. Still switching to default-block.'
-    }
-    # Warn about listening ports that nothing will allow. Without a purge, existing allow rules still count.
-    $covered = @(@($AllowTcp) + $keep | ForEach-Object { "TCP:$_" }) + @(@($AllowUdp) | ForEach-Object { "UDP:$_" })
-    if (-not $State.Purge) { $covered += @(Get-InboundAllowPorts) }
-    $State.Uncovered = @(Get-ListeningPorts | Where-Object { $covered -notcontains "$($_.Proto):$($_.Port)" })
-    $State.Uncovered | ForEach-Object { Write-Log "WARNING: $($_.Proto) $($_.Port) ($($_.Process)) is listening but not covered - this service will be blocked once the firewall is on." }
-    if ($State.Uncovered.Count -and -not $DryRun -and (Read-Host 'Uncovered ports found. Lock down the firewall anyway? y/N') -ne 'y') {
-        $State.Enable = $false; $State.Purge = $false; $block = $false; Write-Log 'Firewall left as it is; HPCC4 rules will still be added at the end.'
-    }
+    $State.Purge = $true
     # Add the keep rules BEFORE removing anything, so RDP never has a gap. Keep rules that already exist are left alone.
-    $keep | Where-Object { -not (Get-NetFirewallRule -Name "HPCC4-Keep-TCP-$_" -ErrorAction SilentlyContinue) } | ForEach-Object { Add-Rule 'Keep' 'TCP' $_ }
-    if ($State.Purge) { Remove-InboundRules -All }
-    if ($block) { Enable-Firewall -BlockInbound }
+    Get-KeepPorts | Where-Object { -not (Get-NetFirewallRule -Name "HPCC4-Keep-TCP-$_" -ErrorAction SilentlyContinue) } | ForEach-Object { Add-Rule 'Keep' 'TCP' $_ }
+    Remove-InboundRules -All
+    Enable-Firewall -BlockInbound
 }
 # Right after the inbound lockdown: allow only $AllowOutTcp/$AllowOutUdp/$AllowOutHosts (+ a member's DCs), remove every
 # other local outbound rule except Core Networking, then block outbound by default. Cuts reverse shells and C2 callbacks.
 function Set-OutboundLockdown {
-    if ($State.IsDC) { Write-Log 'WARNING: domain controller - NOT locking down outbound (replication and AD clients need it).'; return }
-    if (-not $State.Enable) { Write-Log 'Outbound left as it is: the inbound lockdown was declined.'; return }
-    if (-not $DryRun -and -not (Test-Path (Join-Path $OutDir 'firewall-before.wfw'))) { Write-Log 'WARNING: no firewall backup (firewall-before.wfw) - NOT locking down outbound.'; return }
     $hosts = @(Get-OutboundAllowHosts)
-    if ($State.Domain -and -not $hosts.Count) { Write-Log "WARNING: domain member of $($State.Domain) but no DC found and `$AllowOutHosts is empty - NOT locking down outbound (domain logons could break). Put the DC's IP in `$AllowOutHosts."; return }
-    $cut = @(Get-UncoveredOutbound $hosts)
-    $cut | ForEach-Object { Write-Log "WARNING: outbound connection to $($_.Remote) ($($_.Process)) is not allowed and will be cut. Scored dependency? Add it to `$AllowOutTcp or `$AllowOutHosts." }
-    if ($cut.Count -and -not $DryRun -and (Read-Host 'Uncovered outbound connections found. Block outbound anyway? y/N') -ne 'y') { Write-Log 'Outbound left as it is.'; return }
     $rules = [ordered]@{}
     @($AllowOutTcp) | ForEach-Object { $rules["HPCC4-Out-TCP-$_"] = @{ Protocol = 'TCP'; RemotePort = $_ } }
     @($AllowOutUdp) | ForEach-Object { $rules["HPCC4-Out-UDP-$_"] = @{ Protocol = 'UDP'; RemotePort = $_ } }
@@ -209,40 +150,22 @@ function Set-OutboundLockdown {
     Remove-OutboundRules @($rules.Keys)
     $State.OutboundBlocked = Invoke-Step 'block outbound by default' { Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -DefaultOutboundAction Block }
 }
-# Deletes local accounts that aren't authorized. Always kept: built-ins (ID < 1000: Administrator even if renamed, Guest, etc.),
-# you, $AuthorizedUsers, $ExcludeUsers, and accounts that services, app pools or tasks run as. Deleting can't be undone,
-# so each account's SID and groups are printed first, in case you need to recreate it.
+# Deletes every non-built-in local account (ID >= 1000) not in $AuthorizedUsers or $ExcludeUsers. No prompt, and that
+# includes YOUR account and service/app-pool/task accounts if they aren't listed. Deleting can't be undone.
 function Remove-UnauthorizedUsers {
-    if ($State.IsDC) { Write-Log 'Skipping account removal: this is a domain controller.'; return }
     if (-not $AuthorizedUsers) { Write-Log 'Skipping account removal: $AuthorizedUsers is empty.'; return }
-    $keep = @(@($AuthorizedUsers) + @(Get-ProtectedAccountNames))
-    $doomed = @(Get-LocalUser | Where-Object { [int]($_.SID.Value -split '-')[-1] -ge 1000 -and $keep -notcontains $_.Name })
-    if (-not $doomed.Count) { Write-Log 'No unauthorized local accounts found.'; return }
-    Write-Log "UNAUTHORIZED accounts to DELETE: $(($doomed | ForEach-Object { $_.Name }) -join ', ')"
-    if ($DryRun) { Write-Log 'WOULD: delete the accounts above'; return }
-    if ((Read-Host 'DELETE these accounts permanently? y/N') -ne 'y') { return }
-    foreach ($u in $doomed) {
-        $groups = try { (Get-LocalGroup | Where-Object { @((Get-LocalGroupMember $_ -ErrorAction SilentlyContinue).SID.Value) -contains $u.SID.Value }).Name -join ',' } catch { '?' }
-        Write-Log "Deleting $($u.Name) (SID $($u.SID.Value), groups: $groups)"
-        if (Invoke-Step "delete account $($u.Name)" { Remove-LocalUser -SID $u.SID }) { $State.Deleted += $u.Name }
+    $keep = @(@($AuthorizedUsers) + @($ExcludeUsers))
+    foreach ($u in @(Get-LocalUser | Where-Object { [int]($_.SID.Value -split '-')[-1] -ge 1000 -and $keep -notcontains $_.Name })) {
+        if (Invoke-Step "delete account $($u.Name) (SID $($u.SID.Value))" { Remove-LocalUser -SID $u.SID }) { $State.Deleted += $u.Name }
     }
 }
 function Set-LocalPasswords {
-    if ($State.IsDC) { Write-Log 'Skipping password changes: this is a domain controller.'; return }
     $targets = @(Get-PasswordTargets); Write-Log "Password targets: $($targets -join ', ')"
     if ($DryRun) { Write-Log 'WOULD: change passwords for targets above'; return }
-    if ((Read-Host 'Change these passwords? y/N') -ne 'y') { return }
-    # The password stays a SecureString: never logged, echoed or put on a command line. Plain text exists only
-    # for a moment, inline, to check that the two entries match (case-sensitively).
-    $pw = $null
-    for ($i = 0; $i -lt 3 -and -not $pw; $i++) {
-        $s1 = Read-Host 'New password (blank to skip)' -AsSecureString; if ($s1.Length -eq 0) { return }
-        $s2 = Read-Host 'Confirm password' -AsSecureString
-        if ((ConvertFrom-SecureText $s1) -ceq (ConvertFrom-SecureText $s2)) { $pw = $s1 } else { Write-Log 'Passwords did not match, try again.' }
-    }
-    if (-not $pw) { Write-Log 'Password entry failed after 3 tries.'; return }
+    # Entered once, not confirmed: a typo sets that typo on every target. Never logged, echoed or put on a command line.
+    $pw = Read-Host 'New password (blank to skip)' -AsSecureString; if ($pw.Length -eq 0) { return }
     foreach ($u in $targets) { if (Invoke-Step "password $u" { Set-LocalUser -Name $u -Password $pw }) { $State.Changed += $u } }
-    $pw = $s1 = $s2 = $null
+    $pw = $null
     Write-Log "Changed accounts: $($State.Changed -join ', ')"; Write-Log 'SUBMIT PASSWORD CHANGES TO THE SCOREBOARD.'
 }
 # RDP Network Level Authentication: no GPO in the DISA package sets it, so the script does. RDP clients must log in
@@ -367,47 +290,20 @@ function Backup-LocalPolicy {
 # Applies this box's OS baseline (+ the Defender STIG) from the GPO bundle with LGPO.exe, then gpupdate. Runs after the
 # firewall and password steps, and after Install-Tools unpacks LGPO.exe + GPO\. Open-ServicePorts re-asserts our rules at the end.
 function Install-DodGpo {
-    if (-not $ApplyStigGpo -and -not $ApplyDefenderStig) { Write-Log 'WARNING: $ApplyStigGpo and $ApplyDefenderStig are both off - no STIG GPO applied.'; return }
     $dir = Join-Path $ToolsDir 'GPO'; $lgpo = Join-Path $ToolsDir 'LGPO.exe'
-    if (-not (Test-Path $dir)) { Write-Log "WARNING: GPO bundle not found: $dir (deleted after an earlier successful apply?) - STIG GPO NOT applied this run."; return }
-    if (-not (Test-Path $lgpo)) { Write-Log "WARNING: LGPO.exe not found ($lgpo). Put it in the tools zip. STIG GPO NOT applied."; return }
+    if (-not (Test-Path $dir)) { Write-Log "GPO bundle not found: $dir - STIG GPO not applied."; return }
     $folders = @()
     if ($ApplyStigGpo) { $os = Get-StigGpoFolder; if ($os) { $folders += $os } }
-    if ($ApplyDefenderStig) {
-        if (Get-Service -Name WinDefend -ErrorAction SilentlyContinue) { $folders += 'Defender' }
-        else { Write-Log 'WARNING: Microsoft Defender (WinDefend) is not installed - Defender STIG skipped. This box needs another AV.' }
-    }
+    if ($ApplyDefenderStig -and (Get-Service -Name WinDefend -ErrorAction SilentlyContinue)) { $folders += 'Defender' }
     # A GPO backup folder is any folder that holds a Backup.xml (the GUID-named subfolders in the bundle).
     $backups = @(foreach ($f in $folders) { Get-ChildItem -Path (Join-Path $dir $f) -Recurse -Filter 'Backup.xml' -ErrorAction SilentlyContinue | ForEach-Object { $_.Directory.FullName } })
-    if (-not $backups.Count) { Write-Log "WARNING: no GPO backups found for '$($folders -join ', ')' under $dir - STIG GPO NOT applied."; return }
-    if (-not (Backup-LocalPolicy $lgpo) -and -not $DryRun) { Write-Log 'WARNING: local policy backup failed - STIG GPO NOT applied (there would be nothing to roll back to).'; return }
+    if (-not $backups.Count) { return }
+    $null = Backup-LocalPolicy $lgpo   # applies even if this backup fails
     $State.GpoBaseline = $folders -join ' + '
-    Write-Log "Applying $($State.GpoBaseline): $($backups.Count) GPO backup(s) with LGPO."
     foreach ($b in $backups) { if (Invoke-Step "LGPO apply $(Split-Path $b -Leaf)" { & $lgpo /g $b }) { $State.GpoApplied += $b } }
     Invoke-Step 'gpupdate /force' { gpupdate /force }
-    # The bundle names the renamed admin account and shows exactly which STIG lines were skipped: don't leave it for a red teamer.
-    if ($State.GpoApplied.Count -eq $backups.Count) { Invoke-Step "delete GPO bundle $dir" { Remove-Item $dir -Recurse -Force } }
-    if ($DryRun) { return }
-    Test-GpoResult
-}
-# Right after the GPO applies: warn about policy that changes access to THIS box or undoes the script's own work.
-function Test-GpoResult {
-    $mergeOff = foreach ($prof in 'DomainProfile', 'StandardProfile', 'PrivateProfile', 'PublicProfile') {
-        $v = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\$prof" -Name AllowLocalPolicyMerge -ErrorAction SilentlyContinue).AllowLocalPolicyMerge
-        if ($null -ne $v -and $v -eq 0) { $prof }
-    }
-    # The DoD firewall STIG REQUIRES outbound default-allow, and policy beats the local profile setting.
-    $outAllow = foreach ($prof in 'DomainProfile', 'PrivateProfile', 'PublicProfile') {
-        $v = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\$prof" -Name DefaultOutboundAction -ErrorAction SilentlyContinue).DefaultOutboundAction
-        if ($null -ne $v -and $v -eq 0) { $prof }
-    }
-    if ($outAllow -and $State.OutboundBlocked) { Write-Log "WARNING: GPO sets DefaultOutboundAction=Allow for $($outAllow -join ', ') - the outbound lockdown is OVERRIDDEN by policy. The bundle should never contain firewall policy - rebuild it. See gpo-verification-checklist.md." }
-    if ($mergeOff) { Write-Log "WARNING: GPO sets AllowLocalPolicyMerge=0 for $($mergeOff -join ', ') - local HPCC4-Keep-*/Allow firewall rules are now IGNORED by policy. RDP/SSH may be unreachable even with the rule present. See gpo-verification-checklist.md." }
-    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FIPSAlgorithmPolicy' -Name Enabled -ErrorAction SilentlyContinue).Enabled -eq 1) {
-        Write-Log 'WARNING: FIPS mode is ON (the bundle leaves it alone, so it was on already) - old web apps and RDP/SSH clients may fail.'
-    }
-    $admin = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' }
-    if ($admin) { Write-Log "Built-in Administrator is now named '$($admin.Name)' - log in with that name from now on." }
+    # The bundle names the renamed admin account: don't leave it for a red teamer.
+    Invoke-Step "delete GPO bundle $dir" { Remove-Item $dir -Recurse -Force }
 }
 # Downloads (if a URL) and checks the tools zip, then unzips it into the already-locked ToolsDir.
 function Expand-ToolsZip {
@@ -423,12 +319,11 @@ function Expand-ToolsZip {
 }
 function Install-Tools {
     if (-not $ToolsZip) { Write-Log 'No tools zip set; skipping tools.'; return }
-    if ($State.OutboundBlocked -and @($AllowOutTcp) -notcontains 443) { Write-Log 'WARNING: outbound is blocked and TCP 443 is not in $AllowOutTcp - HTTPS downloads below will fail.' }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12   # GitHub needs TLS 1.2
     $ProgressPreference = 'SilentlyContinue'   # PowerShell 5.1 downloads are many times slower with the progress bar on
     # Lock ToolsDir BEFORE anything goes in, so every file inherits "only admins can write" and nobody can plant a fake tool.
     Invoke-Step 'create ToolsDir' { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
-    if (-not (Invoke-Step 'lock down ToolsDir' { Lock-AdminOnlyAcl $ToolsDir @('*S-1-5-32-545:(OI)(CI)RX') }) -and -not $DryRun) { return }
+    Invoke-Step 'lock down ToolsDir' { Lock-AdminOnlyAcl $ToolsDir @('*S-1-5-32-545:(OI)(CI)RX') }
     Expand-ToolsZip
     # Append (never prepend) ToolsDir to the machine PATH, keeping %vars% in the other entries unexpanded.
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'; $path = (Get-Item $key).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
@@ -460,10 +355,9 @@ function Lock-Paths {
     foreach ($path in $LockPaths) {
         $item = Get-Item $path -ErrorAction SilentlyContinue; if (-not $item) { Write-Log "lock skip (missing): $path"; continue }
         $save = Get-AclSaveFile $path; $isDir = $item.PSIsContainer
-        # Never overwrite a save (a 2nd run would save the LOCKED ACL), and never lock a path whose save failed (-Unlock couldn't undo it).
-        if (-not (Test-Path $save) -and -not (Invoke-Step "save ACL $path" { if ($isDir) { icacls $path /save $save /T } else { icacls $path /save $save }; Set-Content ([IO.Path]::ChangeExtension($save, '.path')) $path }) -and -not $DryRun) { continue }
+        # Never overwrite a save (a 2nd run would save the LOCKED ACL). The lock goes on even if the save fails.
+        if (-not (Test-Path $save)) { Invoke-Step "save ACL $path" { if ($isDir) { icacls $path /save $save /T } else { icacls $path /save $save }; Set-Content ([IO.Path]::ChangeExtension($save, '.path')) $path } }
         Invoke-Step "attrib +R $path" { attrib +R $path }   # before the deny, which blocks attribute changes
-        if (Test-EveryoneDeny $path) { $State.Locked += $path; continue }
         $inherit = if ($isDir) { '(OI)(CI)' } else { '' }
         if (Invoke-Step "deny Everyone $path" { icacls $path /deny "*S-1-1-0:$inherit(W,D,DC)" }) { $State.Locked += $path }
     }
@@ -485,18 +379,17 @@ function Open-ServicePorts {
     if (-not $State.Purge) { Remove-InboundRules }   # a purge already removed the old HPCC4 rules
     @($AllowTcp) | Select-Object -Unique | Where-Object { $keep -notcontains $_ } | ForEach-Object { Add-Rule 'Allow' 'TCP' $_ }
     @($AllowUdp) | Select-Object -Unique | ForEach-Object { Add-Rule 'Allow' 'UDP' $_ }
-    # Windows block rules beat allow rules, so never block a port that is allowed, kept open or used by RDP.
-    foreach ($p in @($BlockTcp)) { if ((@($AllowTcp) + $keep) -contains $p) { Write-Log "REFUSED block TCP $p - it is allowed, kept open or the RDP port"; $State.BlocksRefused += "TCP:$p" } else { Add-Rule 'Block' 'TCP' $p } }
-    foreach ($p in @($BlockUdp)) { if (@($AllowUdp) -contains $p) { Write-Log "REFUSED block UDP $p - it is allowed"; $State.BlocksRefused += "UDP:$p" } else { Add-Rule 'Block' 'UDP' $p } }
+    # Windows block rules beat allow rules: a port in both $BlockTcp and $AllowTcp (or the RDP port) ends up BLOCKED.
+    @($BlockTcp) | ForEach-Object { Add-Rule 'Block' 'TCP' $_ }
+    @($BlockUdp) | ForEach-Object { Add-Rule 'Block' 'UDP' $_ }
     if ($State.Enable -and -not $State.FirewallOn) { Enable-Firewall }
 }
 function Write-Summary {
-    Write-Log "Backup: $($State.BackupDir) | Uncovered ports: $($State.Uncovered.Count) | Old inbound rules removed: $($State.Purge) | Firewall on: $($State.FirewallOn) | Outbound blocked: $($State.OutboundBlocked)"
-    Write-Log "Rules added: $($State.RulesAdded -join ', ') | Blocks refused: $($State.BlocksRefused -join ', ') | Accounts deleted: $($State.Deleted -join ', ') | Passwords changed: $($State.Changed -join ', ')"
+    Write-Log "Backup: $($State.BackupDir) | Old inbound rules removed: $($State.Purge) | Firewall on: $($State.FirewallOn) | Outbound blocked: $($State.OutboundBlocked)"
+    Write-Log "Rules added: $($State.RulesAdded -join ', ') | Accounts deleted: $($State.Deleted -join ', ') | Passwords changed: $($State.Changed -join ', ')"
     Write-Log "Extra services disabled: $($State.ServicesDisabled -join ', ')"
     Write-Log "Persistence entries: $($State.Persistence.Count) ($(@($State.Persistence | Where-Object { $_.Suspicious }).Count) suspicious) | DoD GPOs applied: $($State.GpoApplied.Count) ($($State.GpoBaseline))"
     Write-Log "Tools installed: $($State.ToolsInstalled) | Hash check: $($State.HashChecked) | Locked: $($State.Locked -join ', ') | Failures: $($State.Failures -join ', ')"
-    if (-not $State.GpoApplied.Count) { Write-Log 'WARNING: no DoD STIG GPOs were applied this run - the STIG baseline in gpo-verification-checklist.md (WDigest, SMBv1, SMB signing, Guest account, lockout, ...) was NOT applied unless an earlier run or you did it.' }
 }
 # Clears PS history and every Windows event log, then deletes this script file - and its folder only if that leaves it
 # empty. Never a whole folder: run from the Desktop or Downloads, that would wipe it, and $OutDir's backups and ACL saves
@@ -522,9 +415,6 @@ function Invoke-Cleanup {
     else { Invoke-Step "delete empty folder $dir (fails if it's your shell's current folder - cd out and delete it)" { Remove-Item -LiteralPath $dir -Force } }
 }
 function Main {
-    if (-not (Test-IsAdmin)) { Write-Log 'Must be run elevated (as Administrator). Exiting.'; exit 1 }
-    # Server 2012 R2 ships PowerShell 4, which lacks Get-LocalUser and Expand-Archive.
-    if ($PSVersionTable.PSVersion.Major -lt 5) { Write-Log "PowerShell $($PSVersionTable.PSVersion) - this script needs 5.1. Install WMF 5.1 (KB3191564 on 2012 R2, needs a reboot), then run it again. Exiting."; exit 1 }
     $null = Initialize-Setup   # $null = hides Invoke-Step's True/False results from the console
     if ($Unlock) { $null = Unlock-Paths; return }
     $null = Backup-Targets

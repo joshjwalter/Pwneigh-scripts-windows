@@ -9,7 +9,7 @@ read access to the box has to actually reverse-engineer it instead of just readi
    [ ] gpo-verification-checklist.md - tells a reader exactly which STIG settings you rely on / skipped
    [ ] stig-package-guide.md        - same: which GPOs you applied, skipped and edited
    [ ] build-gpo-bundle.ps1         - dev-box only; shows every STIG line removed
-   [ ] gpo-bundle\CHANGES.md        - names the renamed admin account. Only gpo-bundle\zip\ goes in the tools zip
+   [ ] gpo-bundle\CHANGES.md        - names the renamed admin account. Only prod\<box>\ folders go to the boxes
    [ ] .git/                        - full uncompiled version history; do not bundle if packaging/compiling
 
 2. STRIP FROM hpcc4-simple.ps1 AND reset-hpcc4.ps1
