@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# GPO backups are applied by LGPO as-is: never rewrite their line endings
+*/GPO/** -text
