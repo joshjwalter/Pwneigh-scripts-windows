@@ -157,6 +157,12 @@ function Set-RdpOnlyUsers {
 }
 function Set-LocalPasswords {
     $State.PwTargets = @((Get-LocalUser | Where-Object Enabled).Name | Where-Object { @($ExcludeUsers) -notcontains $_ })
+    # The box may already require complexity/length, which would reject your passwords: turn those rules off first.
+    $inf = Join-Path $OutDir 'pw-rules-off.inf'
+    Invoke-Step 'password rules off' {
+        Set-Content $inf -Encoding Unicode -Value '[Unicode]', 'Unicode=yes', '[System Access]', 'MinimumPasswordAge = 0', 'MinimumPasswordLength = 0', 'PasswordComplexity = 0', 'PasswordHistorySize = 0', '[Version]', 'signature="$CHICAGO$"', 'Revision=1'
+        secedit /configure /db (Join-Path $OutDir 'pw-rules-off.sdb') /cfg $inf /areas SECURITYPOLICY /quiet
+    }
     if ($DryRun) { $State.Would += "change passwords: $($State.PwTargets -join ', ')"; return }
     $pw = Read-Host "New password for $($State.PwTargets.Count) accounts (blank to skip)" -AsSecureString
     if ($pw.Length -eq 0) { Skip 'no password entered'; return }
