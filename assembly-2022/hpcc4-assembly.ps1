@@ -1,4 +1,4 @@
-param([switch]$DryRun, [switch]$Unlock)
+param([switch]$DryRun, [switch]$Unlock, [string]$ToolsZip)   # -ToolsZip: a zip already downloaded (the Pwneigh-Start script passes one)
 # assembly-4 (Server 2022): scored RDP (jmoney) + Jenkins 8080. Run elevated from this folder: LGPO.exe and GPO\ sit next to it.
 $ExpectedBuild  = 20348          # refuses to run on any other OS build (wrong folder = wrong box)
 $KeepOpenTcp    = @()            # inbound open for the whole run, besides the live RDP port
@@ -14,7 +14,7 @@ $AuthorizedUsers = @('plinktern', 'jmoney')
 $RdpOnlyUsers   = @('jmoney')    # enabled, in Remote Desktop Users, and taken OUT of Administrators
 $DisableUsers   = @()
 $ToolsDir       = 'C:\Tools'
-$ToolsZip       = 'https://github.com/joshjwalter/Pwneigh-Tools/archive/refs/heads/main.zip'
+if (-not $ToolsZip) { $ToolsZip = 'https://github.com/joshjwalter/Pwneigh-Tools/archive/refs/heads/main.zip' }
 $ToolsZipSha256 = ''
 $AvInstallerUrl = 'https://free.360totalsecurity.com/totalsecurity/360TS_Setup_11.0.0.1314.exe'   # offline installer (~115 MB): installs with no internet
 $InstallSysmon  = $false
