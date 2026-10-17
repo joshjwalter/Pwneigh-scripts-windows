@@ -45,6 +45,7 @@ function Invoke-Step {
 function Skip { param([string]$Why) $script:SkipWhy = $Why }
 function Invoke-Phase {
     param([string]$Name, [scriptblock]$Action)
+    Write-Host "[$(Get-Date -Format HH:mm:ss)] $Name..." -ForegroundColor DarkGray   # shows where a slow or stuck run is
     $f = $State.Failures.Count; $w = $State.Would.Count; $script:SkipWhy = ''
     try { & $Action 2>&1 | ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $State.Failures += "$_" } } }
     catch { $State.Failures += $_.Exception.Message }
@@ -173,6 +174,7 @@ function Set-LocalPasswords {
 # installer into the admin-only OutDir and opens it; it needs no internet after that, so outbound closes right away.
 function Start-AvInstaller {
     if (-not $AvInstallerUrl) { Skip '$AvInstallerUrl is empty'; return }
+    if (Test-Path "${env:ProgramFiles(x86)}\360\Total Security") { Skip '360TS already installed'; return }
     $av = Join-Path $OutDir (Split-Path $AvInstallerUrl -Leaf)
     if (-not (Invoke-Step 'download AV installer' { Invoke-WebRequest $AvInstallerUrl -OutFile $av -UseBasicParsing })) { return }
     $sig = Get-AuthenticodeSignature $av
@@ -317,8 +319,13 @@ function Lock-Paths {
         $save = Get-AclSaveFile $path; $isDir = $item.PSIsContainer
         if (-not (Test-Path $save)) { Invoke-Step "save ACL $path" { if ($isDir) { icacls $path /save $save /T } else { icacls $path /save $save }; Set-Content ([IO.Path]::ChangeExtension($save, '.path')) $path } }
         Invoke-Step "attrib +R $path" { attrib +R $path }
-        $inherit = if ($isDir) { '(OI)(CI)' } else { '' }
-        Invoke-Step "deny Everyone $path" { icacls $path /deny "*S-1-1-0:$inherit(W,D,DC)" }
+        $inherit = if ($isDir) { 'ContainerInherit, ObjectInherit' } else { 'None' }
+        # Not icacls: its deny entries always include SYNCHRONIZE, which stops everyone from even reading the file.
+        Invoke-Step "deny Everyone write/delete $path" {
+            $acl = $item.GetAccessControl('Access')
+            $acl.SetAccessRule((New-Object Security.AccessControl.FileSystemAccessRule ([Security.Principal.SecurityIdentifier]'S-1-1-0'), 'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles', $inherit, 'None', 'Deny'))
+            $item.SetAccessControl($acl)
+        }
     }
 }
 function Unlock-Paths {
