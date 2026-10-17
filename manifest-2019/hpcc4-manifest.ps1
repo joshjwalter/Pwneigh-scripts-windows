@@ -17,7 +17,7 @@ $ToolsDir       = 'C:\Tools'
 if (-not $ToolsZip) { $ToolsZip = 'https://github.com/joshjwalter/Pwneigh-Tools/archive/refs/heads/main.zip' }
 $ToolsZipSha256 = ''
 $AvInstallerUrl = 'https://free.360totalsecurity.com/totalsecurity/360TS_Setup_11.0.0.1314.exe'   # offline installer (~115 MB): installs with no internet
-$InstallSysmon  = $false
+$InstallSysmon  = $true
 $BackupPaths    = @('C:\Windows\System32\drivers\etc\hosts')
 $LockPaths      = @('C:\Windows\System32\drivers\etc\hosts')
 $OutDir         = 'C:\HPCC4'
@@ -302,9 +302,9 @@ function Install-Tools {
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'; $path = (Get-Item $key).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
     if (@($path -split ';' | ForEach-Object { $_.TrimEnd('\') }) -notcontains $ToolsDir.TrimEnd('\')) { Invoke-Step 'add ToolsDir to PATH' { New-ItemProperty $key -Name Path -Value "$path;$ToolsDir" -PropertyType ExpandString -Force | Out-Null } }
     Invoke-Step 'accept Sysinternals EULA' { New-Item 'HKCU:\Software\Sysinternals' -ErrorAction SilentlyContinue | Out-Null; New-ItemProperty 'HKCU:\Software\Sysinternals' -Name EulaAccepted -Value 1 -PropertyType DWord -Force | Out-Null }
-    $exe = Join-Path $ToolsDir 'Sysmon64.exe'; $cfg = Join-Path $ToolsDir 'sysmonconfig.xml'
+    $exe = Join-Path $ToolsDir 'sm.exe'; $cfg = Join-Path $ToolsDir 'sysmonconfig.xml'
     if ($InstallSysmon -and (Test-Path $exe) -and (Test-Path $cfg)) {
-        if (Get-Service Sysmon64, Sysmon -ErrorAction SilentlyContinue) { Invoke-Step 'update Sysmon config' { & $exe -c $cfg } } else { Invoke-Step 'install Sysmon' { & $exe -accepteula -i $cfg } }
+        if (Get-Service sm, Sysmon64, Sysmon -ErrorAction SilentlyContinue) { Invoke-Step 'update Sysmon config' { & $exe -c $cfg } } else { Invoke-Step 'install Sysmon' { & $exe -accepteula -i $cfg } }
     }
 }
 
